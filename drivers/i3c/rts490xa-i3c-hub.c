@@ -1902,6 +1902,20 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 	struct logical_bus *bus;
 	int ret;
 	int i;
+	unsigned int reg_val = 0;
+
+	/* record reg 81: tp hubnetwork connection setting */
+	ret = regmap_read(priv->regmap, I3C_HUB_TP_NET_CON_CONF, &reg_val);
+	if (ret) {
+		dev_warn(dev, "Failed to read hubnetwork connection setting\n");
+		return;
+	}
+
+	ret = regmap_write(priv->regmap, I3C_HUB_TP_NET_CON_CONF, 0x00);
+	if (ret) {
+		dev_warn(dev, "Failed to close Target Port(s)\n");
+		return;
+	}
 
 	for (i = 0; i < I3C_HUB_LOGICAL_BUS_MAX_COUNT; ++i) {
 		bus = &priv->logical_bus[i];
@@ -1909,48 +1923,50 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 			ret = regmap_update_bits(
 				priv->regmap, I3C_HUB_TP_NET_CON_CONF,
 				GENMASK(bus->tp_id, bus->tp_id), bus->tp_map);
-			if (ret)
+			if (ret) {
 				dev_warn(dev,
 					 "Failed to open Target Port(s)\n");
+				return;
+			}
 
 			dev->of_node = bus->of_node;
 			ret = i3c_hub_logic_register(&bus->controller, dev);
-			if (ret)
+			if (ret) {
 				dev_warn(
 					dev,
 					"Failed to register i3c controller - bus id:%i\n",
 					i);
-			else
+				return;
+			} else
 				bus->registered = true;
 
 			ret = regmap_update_bits(
 				priv->regmap, I3C_HUB_TP_NET_CON_CONF,
 				GENMASK(bus->tp_id, bus->tp_id), 0x00);
-			if (ret)
+			if (ret) {
 				dev_warn(dev,
 					 "Failed to close Target Port(s)\n");
-		}
-	}
+				return;
+			}
 
-	for (i = 0; i < I3C_HUB_LOGICAL_BUS_MAX_COUNT; ++i) {
-		bus = &priv->logical_bus[i];
-		if (bus->available) {
-			if (priv->settings.tp[i].always_enable) {
-				ret = regmap_update_bits(
-					priv->regmap, I3C_HUB_TP_NET_CON_CONF,
-					GENMASK(bus->tp_id, bus->tp_id),
-					bus->tp_map);
-				if (ret)
-					dev_warn(
-						dev,
-						"Failed to open Target Port(s)\n");
+			if (!priv->settings.tp[i].always_enable) {
+				reg_val &= ~GENMASK(bus->tp_id, bus->tp_id);
 			}
 		}
 	}
 
+	/* update tp hubnetwork connection setting */
+	ret = regmap_write(priv->regmap, I3C_HUB_TP_NET_CON_CONF, reg_val);
+	if (ret) {
+		dev_warn(dev, "Failed to open Target Port(s)\n");
+		return;
+	}
+
 	ret = i3c_master_do_daa(priv->driving_master);
-	if (ret)
+	if (ret) {
 		dev_warn(dev, "Failed to run DAA\n");
+		return;
+	}
 
 	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; i++) {
 		bus = &priv->logical_bus[i];
