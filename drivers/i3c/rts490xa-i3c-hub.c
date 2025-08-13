@@ -90,6 +90,8 @@
 #define IO_STRENGTH_50_OHM	0x03
 
 #define I3C_HUB_NET_OPER_MODE_CONF 0x15
+#define I3C_HUB_NET_ALWAYS_I3C_EN  BIT(5)
+
 #define I3C_HUB_LDO_CONF	   0x16
 #define CP0_LDO_VOLTAGE_MASK	   GENMASK(1, 0)
 #define CP0_LDO_VOLTAGE(x)	   (((x) << 0) & CP0_LDO_VOLTAGE_MASK)
@@ -149,6 +151,10 @@
 #define CONTROLLER_PORT_MUX_REQ		      BIT(0)
 #define I3C_HUB_CP_MUX_STS		      0x39
 #define CONTROLLER_PORT_MUX_CONNECTION_STATUS BIT(0)
+
+/* Target Dynamic Address Assignment Flag Registers */
+#define I3C_HUB_TARGET_DA_FLAG_BYTE_BASE  0x40
+#define I3C_HUB_TARGET_DA_FLAG_BYTE_COUNT 16
 
 /* Target Ports Control Registers */
 #define I3C_HUB_TP_SMBUS_AGNT_TRANS_START 0x50
@@ -318,6 +324,7 @@ struct dt_settings {
 	u8 tp0145_io_strength;
 	u8 tp2367_io_strength;
 	struct tp_setting tp[I3C_HUB_TP_MAX_COUNT];
+	bool hub_net_always_i3c;
 };
 
 struct smbus_backend {
@@ -583,6 +590,9 @@ static void i3c_hub_of_get_conf_static(struct device *dev,
 			       ARRAY_SIZE(io_strength_settings),
 			       &priv->settings.tp2367_io_strength);
 
+	priv->settings.hub_net_always_i3c =
+		of_property_read_bool(node, "hub-net-always-i3c");
+
 	i3c_hub_tp_of_get_setting(dev, node, priv->settings.tp);
 }
 
@@ -605,6 +615,7 @@ static void i3c_hub_of_default_configuration(struct device *dev)
 	priv->settings.cp1_io_strength = I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED;
 	priv->settings.tp0145_io_strength = I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED;
 	priv->settings.tp2367_io_strength = I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED;
+	priv->settings.hub_net_always_i3c = false;
 
 	for (id = 0; id < I3C_HUB_TP_MAX_COUNT; ++id) {
 		priv->settings.tp[id].mode = I3C_HUB_DT_TP_MODE_NOT_DEFINED;
@@ -849,6 +860,29 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 				  i3c_mask, i3c_val);
 }
 
+static int i3c_hub_hw_configure_misc(struct device *dev)
+{
+	struct i3c_hub *priv = dev_get_drvdata(dev);
+	int ret;
+	u8 reg = I3C_HUB_TARGET_DA_FLAG_BYTE_BASE;
+	u8 val[I3C_HUB_TARGET_DA_FLAG_BYTE_COUNT];
+
+	if (!priv->settings.hub_net_always_i3c)
+		return 0;
+
+	memset(val, 0xff, I3C_HUB_TARGET_DA_FLAG_BYTE_COUNT);
+
+	ret = regmap_update_bits(priv->regmap, I3C_HUB_NET_OPER_MODE_CONF,
+				 I3C_HUB_NET_ALWAYS_I3C_EN,
+				 I3C_HUB_NET_ALWAYS_I3C_EN);
+	if (ret)
+		return ret;
+
+	ret = regmap_bulk_write(priv->regmap, reg, val,
+				I3C_HUB_TARGET_DA_FLAG_BYTE_COUNT);
+	return ret;
+}
+
 static int i3c_hub_configure_hw(struct device *dev)
 {
 	int ret;
@@ -865,7 +899,12 @@ static int i3c_hub_configure_hw(struct device *dev)
 	if (ret)
 		return ret;
 
-	return i3c_hub_hw_configure_tp(dev);
+	ret = i3c_hub_hw_configure_tp(dev);
+	if (ret)
+		return ret;
+
+	ret = i3c_hub_hw_configure_misc(dev);
+	return ret;
 }
 
 static void i3c_hub_of_get_conf_runtime(struct device *dev,
@@ -1029,6 +1068,8 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 			  &settings->tp0145_pullup);
 	debugfs_create_u8("tp2367-pullup", 0400, dt_conf_dir,
 			  &settings->tp2367_pullup);
+	debugfs_create_bool("hub-net-always-i3c", 0400, dt_conf_dir,
+			    &settings->hub_net_always_i3c);
 
 	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; ++i) {
 		char file_name[32];
