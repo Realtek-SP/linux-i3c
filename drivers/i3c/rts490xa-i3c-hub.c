@@ -302,6 +302,18 @@
 #define IBI_MAX_PAYLOAD_LEN 16
 #define IBI_SLOT_NUMS	    4
 
+#define I3C_HUB_IO_CTRL_PAGE			0x81
+#define I3C_HUB_CFG_TP_SCL_L_ACK_CLK		0xDB
+#define I3C_HUB_CFG_TP_SCL_L_ACK_CLK_EN		BIT(6)
+#define I3C_HUB_CFG_TP_SCL_L_ACK_CLK_COUNT_MASK GENMASK(5, 0)
+#define I3C_HUB_CFG_TP_SCL_L_ACK_CLK_COUNT_VAL	0x18
+
+#define I3C_HUB_CFG_TP_SCL_H_ACK_CLK		0xDC
+#define I3C_HUB_CFG_TP_SCL_H_ACK_CLK_EN		BIT(4)
+#define I3C_HUB_CFG_TP_SCL_H_ACK_CLK_COUNT_MASK GENMASK(3, 0)
+#define I3C_HUB_CFG_TP_SCL_H_ACK_CLK_COUNT_VAL(x) \
+	((x) & I3C_HUB_CFG_TP_SCL_H_ACK_CLK_COUNT_MASK)
+
 #define I3C_HUB_EFUSE_PAGE	  0x7B
 #define I3C_HUB_EFUSE_OFFSET_A3	  0xA3
 #define I3C_HUB_FAST_DRV_LOOP_DIS BIT(5)
@@ -333,6 +345,7 @@ struct dt_settings {
 	u8 tp2367_io_strength;
 	struct tp_setting tp[I3C_HUB_TP_MAX_COUNT];
 	bool hub_net_always_i3c;
+	u8 tp_scl_h_ack_cycles;
 };
 
 struct smbus_backend {
@@ -550,6 +563,7 @@ static void i3c_hub_of_get_conf_static(struct device *dev,
 				       const struct device_node *node)
 {
 	struct i3c_hub *priv = dev_get_drvdata(dev);
+	u8 val = 0;
 
 	i3c_hub_of_get_setting(dev, node, "cp0-ldo-en", ldo_en_settings,
 			       ARRAY_SIZE(ldo_en_settings),
@@ -601,6 +615,9 @@ static void i3c_hub_of_get_conf_static(struct device *dev,
 	priv->settings.hub_net_always_i3c =
 		of_property_read_bool(node, "hub-net-always-i3c");
 
+	if (!of_property_read_u8(node, "tp-scl-h-ack-cycles", &val))
+		priv->settings.tp_scl_h_ack_cycles = val;
+
 	i3c_hub_tp_of_get_setting(dev, node, priv->settings.tp);
 }
 
@@ -624,6 +641,7 @@ static void i3c_hub_of_default_configuration(struct device *dev)
 	priv->settings.tp0145_io_strength = I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED;
 	priv->settings.tp2367_io_strength = I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED;
 	priv->settings.hub_net_always_i3c = false;
+	priv->settings.tp_scl_h_ack_cycles = 0;
 
 	for (id = 0; id < I3C_HUB_TP_MAX_COUNT; ++id) {
 		priv->settings.tp[id].mode = I3C_HUB_DT_TP_MODE_NOT_DEFINED;
@@ -937,6 +955,39 @@ static int i3c_hub_hw_configure_fuse_latch(struct device *dev)
 					i3c_hub_cfg_op_fuse_latch);
 }
 
+static int i3c_hub_cfg_op_io(struct i3c_hub *priv)
+{
+	int ret;
+	u8 reg = I3C_HUB_CFG_TP_SCL_L_ACK_CLK;
+
+	/* cfg tp scl low ack clk */
+	ret = regmap_write(priv->regmap, reg,
+			   I3C_HUB_CFG_TP_SCL_L_ACK_CLK_EN |
+				   I3C_HUB_CFG_TP_SCL_L_ACK_CLK_COUNT_VAL);
+	if (ret)
+		return ret;
+
+	/* cfg tp scl high ack clk */
+	reg = I3C_HUB_CFG_TP_SCL_H_ACK_CLK;
+	if (priv->settings.tp_scl_h_ack_cycles == 0)
+		return 0;
+
+	ret = regmap_write(priv->regmap, reg,
+			   I3C_HUB_CFG_TP_SCL_H_ACK_CLK_EN |
+				   I3C_HUB_CFG_TP_SCL_H_ACK_CLK_COUNT_VAL(
+					   priv->settings.tp_scl_h_ack_cycles));
+
+	return ret;
+}
+
+static int i3c_hub_hw_configure_io(struct device *dev)
+{
+	struct i3c_hub *priv = dev_get_drvdata(dev);
+
+	return i3c_hub_hw_cfg_with_page(priv, I3C_HUB_IO_CTRL_PAGE,
+					i3c_hub_cfg_op_io);
+}
+
 static int i3c_hub_configure_hw(struct device *dev)
 {
 	int ret;
@@ -953,15 +1004,19 @@ static int i3c_hub_configure_hw(struct device *dev)
 	if (ret)
 		return ret;
 
-	ret = i3c_hub_hw_configure_tp(dev);
-	if (ret)
-		return ret;
-
 	ret = i3c_hub_hw_configure_misc(dev);
 	if (ret)
 		return ret;
 
 	ret = i3c_hub_hw_configure_fuse_latch(dev);
+	if (ret)
+		return ret;
+
+	ret = i3c_hub_hw_configure_io(dev);
+	if (ret)
+		return ret;
+
+	ret = i3c_hub_hw_configure_tp(dev);
 	return ret;
 }
 
@@ -1128,6 +1183,8 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 			  &settings->tp2367_pullup);
 	debugfs_create_bool("hub-net-always-i3c", 0400, dt_conf_dir,
 			    &settings->hub_net_always_i3c);
+	debugfs_create_u8("tp-scl-h-ack-cycles", 0400, dt_conf_dir,
+			  &settings->tp_scl_h_ack_cycles);
 
 	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; ++i) {
 		char file_name[32];
