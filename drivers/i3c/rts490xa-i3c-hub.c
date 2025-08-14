@@ -302,6 +302,14 @@
 #define IBI_MAX_PAYLOAD_LEN 16
 #define IBI_SLOT_NUMS	    4
 
+#define I3C_HUB_EFUSE_PAGE	  0x7B
+#define I3C_HUB_EFUSE_OFFSET_A3	  0xA3
+#define I3C_HUB_FAST_DRV_LOOP_DIS BIT(5)
+
+#define I3C_HUB_EFUSE_OFFSET_9E		  0x9E
+#define I3C_HUB_FAST_DRV_H_ADD_CYCLE_MASK GENMASK(5, 4)
+#define I3C_HUB_FAST_DRV_H_ADD_CYCLE_VAL  (3 << 4)
+
 struct tp_setting {
 	u8 mode;
 	u8 pullup_en;
@@ -883,6 +891,52 @@ static int i3c_hub_hw_configure_misc(struct device *dev)
 	return ret;
 }
 
+typedef int (*i3c_hub_cfg_fn)(struct i3c_hub *priv);
+
+static int i3c_hub_hw_cfg_with_page(struct i3c_hub *priv, u8 page,
+				    i3c_hub_cfg_fn op)
+{
+	int ret;
+
+	if (!op)
+		return -EINVAL;
+
+	mutex_lock(&priv->page_mutex);
+	ret = regmap_write(priv->regmap, I3C_HUB_PAGE_PTR, page);
+	if (ret)
+		goto unlock;
+
+	ret = op(priv);
+unlock:
+	regmap_write(priv->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&priv->page_mutex);
+	return ret;
+}
+
+static int i3c_hub_cfg_op_fuse_latch(struct i3c_hub *priv)
+{
+	int ret;
+
+	ret = regmap_update_bits(priv->regmap, I3C_HUB_EFUSE_OFFSET_A3,
+				 I3C_HUB_FAST_DRV_LOOP_DIS,
+				 I3C_HUB_FAST_DRV_LOOP_DIS);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->regmap, I3C_HUB_EFUSE_OFFSET_9E,
+				 I3C_HUB_FAST_DRV_H_ADD_CYCLE_MASK,
+				 I3C_HUB_FAST_DRV_H_ADD_CYCLE_VAL);
+	return ret;
+}
+
+static int i3c_hub_hw_configure_fuse_latch(struct device *dev)
+{
+	struct i3c_hub *priv = dev_get_drvdata(dev);
+
+	return i3c_hub_hw_cfg_with_page(priv, I3C_HUB_EFUSE_PAGE,
+					i3c_hub_cfg_op_fuse_latch);
+}
+
 static int i3c_hub_configure_hw(struct device *dev)
 {
 	int ret;
@@ -904,6 +958,10 @@ static int i3c_hub_configure_hw(struct device *dev)
 		return ret;
 
 	ret = i3c_hub_hw_configure_misc(dev);
+	if (ret)
+		return ret;
+
+	ret = i3c_hub_hw_configure_fuse_latch(dev);
 	return ret;
 }
 
