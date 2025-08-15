@@ -62,7 +62,10 @@
 #define I3C_HUB_BCR	   0x08
 #define I3C_HUB_DCR	   0x09
 #define I3C_HUB_DEV_CAPAB  0x0A
+
 #define I3C_HUB_DEV_REV	   0x0B
+#define I3C_HUB_DEV_REV_LDO_MASK   GENMASK(7, 6)
+#define I3C_HUB_DEV_REV_LDO_GET(x) FIELD_GET(I3C_HUB_DEV_REV_LDO_MASK, (x))
 
 /* Device Configuration Registers */
 #define I3C_HUB_PROTECTION_CODE	  0x10
@@ -322,6 +325,18 @@
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_MASK GENMASK(5, 4)
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_VAL  (3 << 4)
 
+struct i3c_hub_dev_info {
+	const char *model;
+	u16 part_id;
+	u8 n_ports;
+};
+
+static const struct i3c_hub_dev_info i3c_hub_dev_info_table[] = {
+	{ "RTS4900", 0x4000, 4 }, { "RTS4901", 0x4100, 4 },
+	{ "RTS4902", 0x8000, 8 }, { "RTS4903", 0x8100, 8 },
+	{ "RTS4904", 0x4001, 4 }, { "RTS4906", 0x8001, 8 }
+};
+
 struct tp_setting {
 	u8 mode;
 	u8 pullup_en;
@@ -388,6 +403,7 @@ struct i3c_hub {
 	struct i3c_device *i3cdev;
 	struct i3c_master_controller *driving_master;
 	struct regmap *regmap;
+	const struct i3c_hub_dev_info *dev_info;
 	struct dt_settings settings;
 	struct delayed_work delayed_work;
 	int hub_pin_sel_id;
@@ -619,6 +635,32 @@ static void i3c_hub_of_get_conf_static(struct device *dev,
 		priv->settings.tp_scl_h_ack_cycles = val;
 
 	i3c_hub_tp_of_get_setting(dev, node, priv->settings.tp);
+}
+
+static const struct i3c_hub_dev_info *
+i3c_hub_lookup_dev_info(struct i3c_hub *priv)
+{
+	int i, ret;
+	u16 part_id = 0;
+	u32 val = 0;
+
+	ret = regmap_read(priv->regmap, I3C_HUB_DEV_INFO_0, &val);
+	if (ret)
+		return ERR_PTR(ret);
+
+	part_id = (val & 0xFF) << 8;
+
+	ret = regmap_read(priv->regmap, I3C_HUB_DEV_REV, &val);
+	if (ret)
+		return ERR_PTR(ret);
+
+	part_id |= I3C_HUB_DEV_REV_LDO_GET(val);
+
+	for (i = 0; i < ARRAY_SIZE(i3c_hub_dev_info_table); i++) {
+		if (i3c_hub_dev_info_table[i].part_id == part_id)
+			return &i3c_hub_dev_info_table[i];
+	}
+	return ERR_PTR(-ENODEV);
 }
 
 static void i3c_hub_of_default_configuration(struct device *dev)
@@ -1153,6 +1195,10 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 		return PTR_ERR(entry);
 
 	priv->debug_dir = entry;
+
+	if (priv->dev_info)
+		debugfs_create_str("model", 0400, priv->debug_dir,
+				   (char **)&priv->dev_info->model);
 
 	entry = debugfs_create_dir("dt-conf", priv->debug_dir);
 	if (IS_ERR(entry))
@@ -2600,22 +2646,29 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 	mutex_init(&priv->page_mutex);
 	i3cdev_set_drvdata(i3cdev, priv);
 	INIT_DELAYED_WORK(&priv->delayed_work, i3c_hub_delayed_work);
-	sprintf(hub_id, "i3c-hub-%d-%llx",
-		i3c_dev_get_master(i3cdev->desc)->bus.id,
-		i3cdev->desc->info.pid);
-	ret = i3c_hub_debugfs_init(priv, hub_id);
-	if (ret)
-		dev_dbg(dev, "Failed to initialized DebugFS.\n");
-
 	i3c_hub_of_default_configuration(dev);
 
 	regmap = devm_regmap_init_i3c(i3cdev, &i3c_hub_regmap_config);
 	if (IS_ERR(regmap)) {
 		ret = PTR_ERR(regmap);
 		dev_err(dev, "Failed to register I3C HUB regmap\n");
-		goto error;
+		return ret;
 	}
 	priv->regmap = regmap;
+
+	priv->dev_info = i3c_hub_lookup_dev_info(priv);
+	if (IS_ERR(priv->dev_info)) {
+		ret = PTR_ERR(priv->dev_info);
+		dev_err(dev, "Failed to lookup HUB dev info\n");
+		return ret;
+	}
+
+	sprintf(hub_id, "i3c-hub-%d-%llx",
+		i3c_dev_get_master(i3cdev->desc)->bus.id,
+		i3cdev->desc->info.pid);
+	ret = i3c_hub_debugfs_init(priv, hub_id);
+	if (ret)
+		dev_dbg(dev, "Failed to initialized DebugFS.\n");
 
 	ret = i3c_hub_read_id(dev);
 	if (ret)
