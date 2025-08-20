@@ -324,6 +324,8 @@
 #define I3C_HUB_EFUSE_OFFSET_9E		  0x9E
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_MASK GENMASK(5, 4)
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_VAL  (3 << 4)
+#define I3C_HUB_IBI_ACK_RD_CYCLE_MASK	  GENMASK(3, 0)
+#define I3C_HUB_IBI_ACK_RD_CYCLE_VAL	  (5)
 
 struct i3c_hub_dev_info {
 	const char *model;
@@ -361,6 +363,7 @@ struct dt_settings {
 	struct tp_setting tp[I3C_HUB_TP_MAX_COUNT];
 	bool hub_net_always_i3c;
 	u8 tp_scl_h_ack_cycles;
+	bool handshake_optimize;
 };
 
 struct smbus_backend {
@@ -635,6 +638,9 @@ static void i3c_hub_of_get_conf_static(struct device *dev,
 		priv->settings.tp_scl_h_ack_cycles = val;
 
 	i3c_hub_tp_of_get_setting(dev, node, priv->settings.tp);
+
+	priv->settings.handshake_optimize =
+		of_property_read_bool(node, "handshake-optimize");
 }
 
 static const struct i3c_hub_dev_info *
@@ -684,6 +690,7 @@ static void i3c_hub_of_default_configuration(struct device *dev)
 	priv->settings.tp2367_io_strength = I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED;
 	priv->settings.hub_net_always_i3c = false;
 	priv->settings.tp_scl_h_ack_cycles = 0;
+	priv->settings.handshake_optimize = false;
 
 	for (id = 0; id < I3C_HUB_TP_MAX_COUNT; ++id) {
 		priv->settings.tp[id].mode = I3C_HUB_DT_TP_MODE_NOT_DEFINED;
@@ -977,6 +984,14 @@ static int i3c_hub_cfg_op_fuse_latch(struct i3c_hub *priv)
 {
 	int ret;
 
+	if (priv->settings.handshake_optimize) {
+		ret = regmap_update_bits(priv->regmap, I3C_HUB_EFUSE_OFFSET_9E,
+					 I3C_HUB_IBI_ACK_RD_CYCLE_MASK,
+					 I3C_HUB_IBI_ACK_RD_CYCLE_VAL);
+		if (ret)
+			return ret;
+	}
+
 	ret = regmap_update_bits(priv->regmap, I3C_HUB_EFUSE_OFFSET_A3,
 				 I3C_HUB_FAST_DRV_LOOP_DIS,
 				 I3C_HUB_FAST_DRV_LOOP_DIS);
@@ -1234,6 +1249,8 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 			    &settings->hub_net_always_i3c);
 	debugfs_create_u8("tp-scl-h-ack-cycles", 0400, dt_conf_dir,
 			  &settings->tp_scl_h_ack_cycles);
+	debugfs_create_bool("handshake-optimize", 0400, dt_conf_dir,
+			    &settings->handshake_optimize);
 
 	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; ++i) {
 		char file_name[32];
