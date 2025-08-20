@@ -1121,6 +1121,9 @@ static struct device_node *i3c_hub_get_dt_hub_node(struct device_node *node,
 
 	for_each_available_child_of_node(node, hub_node) {
 		id_mask = 0;
+		priv->hub_dt_sel_id = -1;
+		priv->hub_dt_cp1_id = -1;
+
 		if (strstr(hub_node->name, "hub")) {
 			if (!of_property_read_u32(hub_node, "id", &hub_id)) {
 				id_mask |= 0x0f;
@@ -1133,10 +1136,10 @@ static struct device_node *i3c_hub_get_dt_hub_node(struct device_node *node,
 				priv->hub_dt_cp1_id = hub_id;
 			}
 
-			dt_id = (u32)priv->hub_dt_cp1_id << 4 |
-				(u32)priv->hub_dt_sel_id;
-			pin_id = (u32)priv->hub_pin_cp1_id << 4 |
-				 (u32)priv->hub_pin_sel_id;
+			dt_id = ((u32)priv->hub_dt_cp1_id & 0x0f) << 4 |
+				((u32)priv->hub_dt_sel_id & 0x0f);
+			pin_id = ((u32)priv->hub_pin_cp1_id & 0x0f) << 4 |
+				 ((u32)priv->hub_pin_sel_id & 0x0f);
 
 			if (id_mask != 0 &&
 			    (dt_id & id_mask) == (pin_id & id_mask))
