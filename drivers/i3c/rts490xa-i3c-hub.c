@@ -38,8 +38,6 @@
 
 #define I3C_HUB_TP_MAX_COUNT 0x08
 
-#define I3C_HUB_LOGICAL_BUS_MAX_COUNT 0x08
-
 #define GPIO_BANK_SZ  0x02
 #define GPIO_MAX_BANK I3C_HUB_TP_MAX_COUNT
 
@@ -420,7 +418,7 @@ struct i3c_hub {
 	int hub_dt_sel_id;
 	int hub_dt_cp1_id;
 
-	struct logical_bus logical_bus[I3C_HUB_LOGICAL_BUS_MAX_COUNT];
+	struct logical_bus logical_bus[I3C_HUB_TP_MAX_COUNT];
 	struct mutex page_mutex;
 
 	/* Offset for reading HUB's register. */
@@ -554,6 +552,7 @@ static void i3c_hub_tp_of_get_setting(struct device *dev,
 				      const struct device_node *node,
 				      struct tp_setting tp_setting[])
 {
+	struct i3c_hub *priv = dev_get_drvdata(dev);
 	struct device_node *tp_node;
 	u32 id;
 
@@ -569,7 +568,7 @@ static void i3c_hub_tp_of_get_setting(struct device *dev,
 			continue;
 		}
 
-		if (id >= I3C_HUB_TP_MAX_COUNT) {
+		if (id >= priv->dev_info->n_ports) {
 			dev_warn(dev,
 				 "Invalid target port index found in DT: %i\n",
 				 id);
@@ -873,8 +872,7 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 	int ret;
 	int i, index;
 
-	/* TBD: Read type of HUB from register I3C_HUB_DEV_INFO_0 to learn target ports count. */
-	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; ++i) {
+	for (i = 0; i < priv->dev_info->n_ports; ++i) {
 		if (priv->settings.tp[i].mode !=
 		    I3C_HUB_DT_TP_MODE_NOT_DEFINED) {
 			i3c_mask |= TPn_NET_CON(i);
@@ -1103,7 +1101,7 @@ static void i3c_hub_of_get_conf_runtime(struct device *dev,
 			    &tp_mask) != 2))
 			continue;
 
-		if (i3c_id < I3C_HUB_LOGICAL_BUS_MAX_COUNT) {
+		if (i3c_id < priv->dev_info->n_ports) {
 			priv->logical_bus[i3c_id].available = true;
 			priv->logical_bus[i3c_id].of_node = i3c_node;
 			priv->logical_bus[i3c_id].tp_map = tp_mask;
@@ -1264,7 +1262,7 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 	debugfs_create_bool("handshake-optimize", 0400, dt_conf_dir,
 			    &settings->handshake_optimize);
 
-	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; ++i) {
+	for (i = 0; i < priv->dev_info->n_ports; ++i) {
 		char file_name[32];
 
 		sprintf(file_name, "tp%i.mode", i);
@@ -1929,7 +1927,7 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 		return;
 	}
 
-	for (i = 0; i < I3C_HUB_LOGICAL_BUS_MAX_COUNT; ++i) {
+	for (i = 0; i < priv->dev_info->n_ports; ++i) {
 		bus = &priv->logical_bus[i];
 		if (bus->available) {
 			ret = regmap_update_bits(
@@ -1980,7 +1978,7 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 		return;
 	}
 
-	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; i++) {
+	for (i = 0; i < priv->dev_info->n_ports; i++) {
 		bus = &priv->logical_bus[i];
 		if (!bus->smbus_port_adapter.used)
 			continue;
@@ -2316,7 +2314,7 @@ static int read_backend_from_i3c_hub_dts(struct device_node *i3c_node_target,
 	if (sscanf(i3c_node_target->full_name, "target-port@%d", &tp_port) == 0)
 		return -EINVAL;
 
-	if (tp_port > I3C_HUB_TP_MAX_COUNT)
+	if (tp_port > priv->dev_info->n_ports)
 		return -ERANGE;
 
 	if (tp_port < 0)
@@ -2763,7 +2761,7 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 	}
 
 	/* Register logic for native smbus ports */
-	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; i++) {
+	for (i = 0; i < priv->dev_info->n_ports; i++) {
 		priv->logical_bus[i].smbus_port_adapter.used = 0;
 		if (priv->settings.tp[i].mode == I3C_HUB_DT_TP_MODE_SMBUS)
 			ret = i3c_hub_smbus_tp_algo(priv, i);
@@ -2835,7 +2833,7 @@ static void i3c_hub_remove(struct i3c_device *i3cdev)
 	i3c_device_disable_ibi(i3cdev);
 	i3c_device_free_ibi(i3cdev);
 
-	for (i = 0; i < I3C_HUB_TP_MAX_COUNT; i++) {
+	for (i = 0; i < priv->dev_info->n_ports; i++) {
 		if (priv->logical_bus[i].smbus_port_adapter.used) {
 			g_adap = &priv->logical_bus[i].smbus_port_adapter;
 			cancel_delayed_work_sync(&g_adap->delayed_work_polling);
