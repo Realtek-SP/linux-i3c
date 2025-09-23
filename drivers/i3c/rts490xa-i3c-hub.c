@@ -2276,8 +2276,8 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 	priv->logical_bus[i].controller.i2c.owner =
 		priv->logical_bus[i].controller.dev.parent->driver->owner;
 
-	sprintf(priv->logical_bus[i].controller.i2c.name, "hub0x%X.port%d",
-		priv->hub_dt_cp1_id, i);
+	sprintf(priv->logical_bus[i].controller.i2c.name, "hub%s.port%d",
+		dev_name(&priv->i3cdev->dev), i);
 
 	priv->logical_bus[i].controller.i2c.timeout = 1000;
 	priv->logical_bus[i].controller.i2c.retries = 3;
