@@ -333,6 +333,12 @@ struct i3c_hub_dev_info {
 	u8 n_ports;
 };
 
+static const struct i3c_hub_dev_info i3c_hub_dev_info_unknown = {
+	.model = "Unknown",
+	.part_id = 0,
+	.n_ports = 8,
+};
+
 static const struct i3c_hub_dev_info i3c_hub_dev_info_table[] = {
 	{ "RTS4900", 0x4000, 4 }, { "RTS4901", 0x4100, 4 },
 	{ "RTS4902", 0x8000, 8 }, { "RTS4903", 0x8100, 8 },
@@ -666,7 +672,7 @@ i3c_hub_lookup_dev_info(struct i3c_hub *priv)
 		if (i3c_hub_dev_info_table[i].part_id == part_id)
 			return &i3c_hub_dev_info_table[i];
 	}
-	return ERR_PTR(-ENODEV);
+	return &i3c_hub_dev_info_unknown;
 }
 
 static void i3c_hub_of_default_configuration(struct device *dev)
@@ -1048,6 +1054,7 @@ static int i3c_hub_hw_configure_io(struct device *dev)
 static int i3c_hub_configure_hw(struct device *dev)
 {
 	int ret;
+	struct i3c_hub *priv = dev_get_drvdata(dev);
 
 	ret = i3c_hub_hw_configure_ldo(dev);
 	if (ret)
@@ -1061,17 +1068,19 @@ static int i3c_hub_configure_hw(struct device *dev)
 	if (ret)
 		return ret;
 
-	ret = i3c_hub_hw_configure_misc(dev);
-	if (ret)
-		return ret;
+	if (priv->dev_info->part_id) {
+		ret = i3c_hub_hw_configure_misc(dev);
+		if (ret)
+			return ret;
 
-	ret = i3c_hub_hw_configure_fuse_latch(dev);
-	if (ret)
-		return ret;
+		ret = i3c_hub_hw_configure_fuse_latch(dev);
+		if (ret)
+			return ret;
 
-	ret = i3c_hub_hw_configure_io(dev);
-	if (ret)
-		return ret;
+		ret = i3c_hub_hw_configure_io(dev);
+		if (ret)
+			return ret;
+	}
 
 	ret = i3c_hub_hw_configure_tp(dev);
 	return ret;
