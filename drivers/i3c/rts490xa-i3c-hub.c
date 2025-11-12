@@ -75,23 +75,25 @@
 #define I3C_HUB_TP_ENABLE 0x12
 #define TPn_ENABLE(n)	  BIT(n)
 
-#define I3C_HUB_DEV_CONF	0x13
-#define I3C_HUB_IO_STRENGTH	0x14
-#define TP0145_IO_STRENGTH_MASK GENMASK(1, 0)
-#define TP0145_IO_STRENGTH(x)	(((x) << 0) & TP0145_IO_STRENGTH_MASK)
-#define TP2367_IO_STRENGTH_MASK GENMASK(3, 2)
-#define TP2367_IO_STRENGTH(x)	(((x) << 2) & TP2367_IO_STRENGTH_MASK)
-#define CP0_IO_STRENGTH_MASK	GENMASK(5, 4)
-#define CP0_IO_STRENGTH(x)	(((x) << 4) & CP0_IO_STRENGTH_MASK)
-#define CP1_IO_STRENGTH_MASK	GENMASK(7, 6)
-#define CP1_IO_STRENGTH(x)	(((x) << 6) & CP1_IO_STRENGTH_MASK)
-#define IO_STRENGTH_20_OHM	0x00
-#define IO_STRENGTH_30_OHM	0x01
-#define IO_STRENGTH_40_OHM	0x02
-#define IO_STRENGTH_50_OHM	0x03
+#define I3C_HUB_DEV_CONF	     0x13
+#define CONTROLLER_PORT_MUX_PRIORITY BIT(0)
+#define I3C_HUB_IO_STRENGTH	     0x14
+#define TP0145_IO_STRENGTH_MASK	     GENMASK(1, 0)
+#define TP0145_IO_STRENGTH(x)	     (((x) << 0) & TP0145_IO_STRENGTH_MASK)
+#define TP2367_IO_STRENGTH_MASK	     GENMASK(3, 2)
+#define TP2367_IO_STRENGTH(x)	     (((x) << 2) & TP2367_IO_STRENGTH_MASK)
+#define CP0_IO_STRENGTH_MASK	     GENMASK(5, 4)
+#define CP0_IO_STRENGTH(x)	     (((x) << 4) & CP0_IO_STRENGTH_MASK)
+#define CP1_IO_STRENGTH_MASK	     GENMASK(7, 6)
+#define CP1_IO_STRENGTH(x)	     (((x) << 6) & CP1_IO_STRENGTH_MASK)
+#define IO_STRENGTH_20_OHM	     0x00
+#define IO_STRENGTH_30_OHM	     0x01
+#define IO_STRENGTH_40_OHM	     0x02
+#define IO_STRENGTH_50_OHM	     0x03
 
 #define I3C_HUB_NET_OPER_MODE_CONF 0x15
 #define I3C_HUB_NET_ALWAYS_I3C_EN  BIT(5)
+#define I3C_HUB_NET_I2C_CH_EN	   BIT(4)
 
 #define I3C_HUB_LDO_CONF	   0x16
 #define CP0_LDO_VOLTAGE_MASK	   GENMASK(1, 0)
@@ -217,6 +219,9 @@
 #define CP_SCL1_LEVEL		      BIT(6)
 #define CP_SEL_PIN_INPUT_CODE_MASK    GENMASK(5, 4)
 #define CP_SEL_PIN_INPUT_CODE_GET(x)  (((x) & CP_SEL_PIN_INPUT_CODE_MASK) >> 4)
+#define CP_SEL_PIN_LOW		      (0)
+#define CP_SEL_PIN_HIZ		      (1)
+#define CP_SEL_PIN_HIGH		      (3)
 #define CP_SDA1_SCL1_PINS_CODE_MASK   GENMASK(7, 6)
 #define CP_SDA1_SCL1_PINS_CODE_GET(x) (((x) & CP_SDA1_SCL1_PINS_CODE_MASK) >> 6)
 #define VCCIO1_PWR_GOOD		      BIT(3)
@@ -315,15 +320,24 @@
 #define I3C_HUB_CFG_TP_SCL_H_ACK_CLK_COUNT_VAL(x) \
 	((x) & I3C_HUB_CFG_TP_SCL_H_ACK_CLK_COUNT_MASK)
 
+#define I3C_HUB_CFG_TP_SCL_PAD		    0xA5
+#define I3C_HUB_CFG_TP_SCL_PAD_OFFSET	    (2)
+#define I3C_HUB_CFG_TP_SCL_PAD_WEAK_PULL_UP BIT(2)
+
 #define I3C_HUB_EFUSE_PAGE	  0x7B
 #define I3C_HUB_EFUSE_OFFSET_A3	  0xA3
 #define I3C_HUB_FAST_DRV_LOOP_DIS BIT(5)
+
+#define I3C_HUB_EFUSE_OFFSET_92 0x92
+#define I3C_HUB_I2C_CH_EN	BIT(3)
 
 #define I3C_HUB_EFUSE_OFFSET_9E		  0x9E
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_MASK GENMASK(5, 4)
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_VAL  (3 << 4)
 #define I3C_HUB_IBI_ACK_RD_CYCLE_MASK	  GENMASK(3, 0)
 #define I3C_HUB_IBI_ACK_RD_CYCLE_VAL	  (5)
+
+#define I3C_HUB_REF_PAGE (0x04)
 
 struct i3c_hub_dev_info {
 	const char *model;
@@ -406,6 +420,15 @@ struct hub_gpio {
 	struct mutex irq_mutex;
 };
 
+struct hub_i2c_channel {
+	bool on_cp0;
+	bool enabled;
+	u8 tp_mask;
+	u8 tp_en;
+	u8 i3c_tp_mask;
+	u8 i3c_tp_en;
+};
+
 struct i3c_hub {
 	struct i3c_device *i3cdev;
 	struct i3c_master_controller *driving_master;
@@ -425,6 +448,7 @@ struct i3c_hub {
 	u8 reg_addr;
 	struct dentry *debug_dir;
 	struct hub_gpio gpio;
+	struct hub_i2c_channel i2c_ch;
 };
 
 struct hub_setting {
@@ -2386,6 +2410,418 @@ static void i3c_hub_parse_dt_tp(struct device *dev,
 	}
 }
 
+static int i3c_hub_is_on_cp0(struct i3c_hub *hub, bool *on_cp0)
+{
+	u32 val;
+	int ret;
+	u8 cp0_mux_req, cp1_mux_req;
+	u8 cp0_mux_prio, cp0_mux_sts;
+
+	/* read cp0 reg 56 */
+	ret = regmap_read(hub->regmap, I3C_HUB_CP_MUX_SET, &val);
+	if (ret)
+		return ret;
+
+	cp0_mux_req = val & CONTROLLER_PORT_MUX_REQ;
+	dev_dbg(&hub->i3cdev->dev, "cp0_mux_req: %d, val: 0x%02x\n",
+		cp0_mux_req, val);
+
+	/* read cp1 reg 56 */
+	mutex_lock(&hub->page_mutex);
+	ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, I3C_HUB_REF_PAGE);
+	if (ret)
+		goto unlock;
+
+	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
+			   CP1_REGISTERS_UNLOCK_CODE);
+	if (ret)
+		goto unlock;
+
+	ret = regmap_read(hub->regmap, 0x80 + I3C_HUB_CP_MUX_SET, &val);
+	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE, REGISTERS_LOCK_CODE);
+	if (ret)
+		goto unlock;
+	cp1_mux_req = val & CONTROLLER_PORT_MUX_REQ;
+	dev_dbg(&hub->i3cdev->dev, "cp1_mux_req: %d, val: 0x%02x\n",
+		cp1_mux_req, val);
+
+	regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&hub->page_mutex);
+
+	/* Set cp0 mux req to cp1 mux req */
+	ret = regmap_update_bits(hub->regmap, I3C_HUB_CP_MUX_SET,
+				 CONTROLLER_PORT_MUX_REQ, cp1_mux_req);
+	if (ret)
+		goto reset;
+
+	ret = regmap_read(hub->regmap, I3C_HUB_DEV_CONF, &val);
+	if (ret)
+		goto reset;
+
+	cp0_mux_prio = val & CONTROLLER_PORT_MUX_PRIORITY;
+	dev_dbg(&hub->i3cdev->dev, "cp0_mux_prio: %d, val: 0x%02x\n",
+		cp0_mux_prio, val);
+	ret = regmap_read(hub->regmap, I3C_HUB_CP_MUX_STS, &val);
+	if (ret)
+		goto reset;
+
+	cp0_mux_sts = val & CONTROLLER_PORT_MUX_CONNECTION_STATUS;
+	dev_dbg(&hub->i3cdev->dev, "cp0_mux_sts: %d, val: 0x%02x\n",
+		cp0_mux_sts, val);
+	*on_cp0 = cp0_mux_prio ^ cp0_mux_sts;
+	dev_dbg(&hub->i3cdev->dev,
+		"cp0_mux_prio: %d, cp0_mux_sts: %d, on_cp0: %d\n", cp0_mux_prio,
+		cp0_mux_sts, *on_cp0);
+
+reset:
+	ret = regmap_update_bits(hub->regmap, I3C_HUB_CP_MUX_SET,
+				 CONTROLLER_PORT_MUX_REQ, cp0_mux_req);
+	return ret;
+unlock:
+	regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&hub->page_mutex);
+	return ret;
+}
+
+static int i3c_hub_get_i2c_channel_settings(struct i3c_hub *hub)
+{
+	int i, ret;
+	struct tp_setting *tp_settings = hub->settings.tp;
+	struct hub_i2c_channel *i2c_ch = &hub->i2c_ch;
+
+	memset(i2c_ch, 0, sizeof(*i2c_ch));
+
+	ret = i3c_hub_is_on_cp0(hub, &i2c_ch->on_cp0);
+	if (ret) {
+		dev_err(&hub->i3cdev->dev,
+			"Failed to check if I2C channel is on cp0, ret %d\n",
+			ret);
+		return ret;
+	}
+
+	if (!i2c_ch->on_cp0) {
+		dev_dbg(&hub->i3cdev->dev, "I2C channel is not on cp0\n");
+		return 0;
+	}
+
+	for (i = 0; i < hub->dev_info->n_ports; i++) {
+		if (tp_settings[i].mode == I3C_HUB_DT_TP_MODE_I3C) {
+			i2c_ch->i3c_tp_mask |= BIT(i);
+		} else if (tp_settings[i].mode ==
+				   I3C_HUB_DT_TP_MODE_NOT_DEFINED ||
+			   tp_settings[i].mode == I3C_HUB_DT_TP_MODE_DISABLED) {
+			i2c_ch->tp_mask |= BIT(i);
+		}
+	}
+
+	return 0;
+}
+
+static int i3c_hub_enable_tp_weak_pull_up(struct i3c_hub *hub, u8 tps,
+					  bool enable)
+{
+	int ret, tp;
+
+	if (!tps)
+		return 0;
+
+	mutex_lock(&hub->page_mutex);
+	ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, I3C_HUB_IO_CTRL_PAGE);
+	if (ret)
+		goto unlock;
+
+	while (tps) {
+		tp = __ffs((unsigned long)tps);
+		tps &= (tps - 1);
+
+		ret |= regmap_update_bits(
+			hub->regmap,
+			I3C_HUB_CFG_TP_SCL_PAD +
+				tp * I3C_HUB_CFG_TP_SCL_PAD_OFFSET,
+			I3C_HUB_CFG_TP_SCL_PAD_WEAK_PULL_UP,
+			enable ? I3C_HUB_CFG_TP_SCL_PAD_WEAK_PULL_UP : 0);
+	}
+unlock:
+	regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&hub->page_mutex);
+	return ret;
+}
+
+static int i3c_hub_connect_i3c_tp(struct i3c_hub *hub, bool connect)
+{
+	u32 val;
+	int ret;
+	struct hub_i2c_channel *i2c_ch = &hub->i2c_ch;
+
+	if (connect) {
+		if (!i2c_ch->i3c_tp_en)
+			return 0;
+
+		ret = i3c_hub_enable_tp_weak_pull_up(hub, i2c_ch->i3c_tp_en,
+						     false);
+		if (ret)
+			return ret;
+
+		ret = regmap_set_bits(hub->regmap, I3C_HUB_TP_NET_CON_CONF,
+				      i2c_ch->i3c_tp_en);
+		if (ret)
+			return ret;
+
+		i2c_ch->i3c_tp_en = 0;
+	} else {
+		ret = regmap_read(hub->regmap, I3C_HUB_TP_NET_CON_CONF, &val);
+		if (ret)
+			return ret;
+
+		val &= i2c_ch->i3c_tp_mask;
+
+		ret = regmap_clear_bits(hub->regmap, I3C_HUB_TP_NET_CON_CONF,
+					val);
+		if (ret)
+			return ret;
+
+		ret = i3c_hub_enable_tp_weak_pull_up(hub, val, true);
+		if (ret)
+			return ret;
+
+		i2c_ch->i3c_tp_en = val;
+	}
+
+	return 0;
+}
+
+static int i3c_hub_enable_i2c_channel(struct i3c_hub *hub, bool enable)
+{
+	int ret;
+	struct hub_i2c_channel *i2c_ch = &hub->i2c_ch;
+
+	mutex_lock(&hub->page_mutex);
+	if (!i2c_ch->enabled && enable) {
+		ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR,
+				   I3C_HUB_EFUSE_PAGE);
+		if (ret)
+			goto unlock;
+
+		ret = regmap_set_bits(hub->regmap, I3C_HUB_EFUSE_OFFSET_92,
+				      I3C_HUB_I2C_CH_EN);
+		if (ret)
+			goto unlock;
+	}
+
+	ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, I3C_HUB_REF_PAGE);
+	if (ret)
+		goto unlock;
+
+	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
+			   CP1_REGISTERS_UNLOCK_CODE);
+	if (ret)
+		goto unlock;
+
+	/* Unlock access to protected registers */
+	ret = regmap_write(hub->regmap, 0x80 + I3C_HUB_PROTECTION_CODE,
+			   REGISTERS_UNLOCK_CODE);
+	if (ret)
+		goto unlock;
+
+	if (enable)
+		ret = regmap_set_bits(hub->regmap,
+				      0x80 + I3C_HUB_NET_OPER_MODE_CONF,
+				      I3C_HUB_NET_I2C_CH_EN);
+	else
+		ret = regmap_clear_bits(hub->regmap,
+					0x80 + I3C_HUB_NET_OPER_MODE_CONF,
+					I3C_HUB_NET_I2C_CH_EN);
+	if (ret)
+		goto unlock;
+
+	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE, REGISTERS_LOCK_CODE);
+	/* Lock access to protected registers */
+	regmap_write(hub->regmap, 0x80 + I3C_HUB_PROTECTION_CODE,
+		     REGISTERS_LOCK_CODE);
+
+unlock:
+	regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&hub->page_mutex);
+	return ret;
+}
+
+static int i3c_hub_cp_mux_set_cp1(struct i3c_hub *hub, bool set)
+{
+	int ret;
+
+	ret = regmap_update_bits(hub->regmap, I3C_HUB_CP_MUX_SET,
+				 CONTROLLER_PORT_MUX_REQ, !set);
+	if (ret)
+		return ret;
+
+	/* Unlock access to protected registers */
+	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
+			   REGISTERS_UNLOCK_CODE);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(hub->regmap, I3C_HUB_DEV_CONF,
+				 CONTROLLER_PORT_MUX_PRIORITY, set);
+
+	/* Lock access to protected registers */
+	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE, REGISTERS_LOCK_CODE);
+
+	return ret;
+}
+
+static int i3c_hub_enable_i2c_channel_tp(struct i3c_hub *hub, u8 tps)
+{
+	struct hub_i2c_channel *i2c_ch = &hub->i2c_ch;
+	int ret;
+
+	if (!i2c_ch->enabled)
+		return -EPERM;
+
+	/* Unlock access to protected registers */
+	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
+			   REGISTERS_UNLOCK_CODE);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(hub->regmap, I3C_HUB_TP_ENABLE,
+				 i2c_ch->tp_mask, tps);
+
+	/* Lock access to protected registers */
+	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE, REGISTERS_LOCK_CODE);
+	if (ret)
+		return ret;
+
+	tps &= i2c_ch->tp_mask;
+	ret = regmap_update_bits(hub->regmap, I3C_HUB_TP_NET_CON_CONF,
+				 i2c_ch->tp_mask, tps);
+	if (ret)
+		return ret;
+
+	i2c_ch->tp_en = tps;
+	return 0;
+}
+
+static int i3c_hub_switch_to_i2c_channel(struct i3c_hub *hub, bool enable)
+{
+	struct hub_i2c_channel *i2c_ch = &hub->i2c_ch;
+	struct i3c_master_controller *master = hub->driving_master;
+	int ret;
+
+	if (!hub->i2c_ch.on_cp0 || hub->hub_pin_sel_id != CP_SEL_PIN_HIZ)
+		return -EPERM;
+
+	if (i2c_ch->enabled == enable)
+		return 0;
+
+	if (enable) {
+		ret = i3c_hub_connect_i3c_tp(hub, false);
+		if (ret)
+			goto unlock;
+
+		ret = i3c_hub_enable_i2c_channel(hub, true);
+		if (ret)
+			goto unlock;
+	} else {
+		ret = i3c_hub_enable_i2c_channel_tp(hub, 0);
+		if (ret)
+			goto unlock;
+
+		ret = i3c_hub_enable_i2c_channel(hub, false);
+		if (ret)
+			goto unlock;
+
+		ret = i3c_hub_connect_i3c_tp(hub, true);
+		if (ret)
+			goto unlock;
+	}
+
+	ret = i3c_hub_cp_mux_set_cp1(hub, enable);
+	if (ret)
+		goto unlock;
+
+	hub->i2c_ch.enabled = enable;
+unlock:
+	return ret;
+}
+
+static ssize_t enable_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct i3c_hub *hub = dev_get_drvdata(dev);
+	return sprintf(buf, "%d\n", hub->i2c_ch.enabled);
+}
+
+static ssize_t enable_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct i3c_hub *hub = dev_get_drvdata(dev);
+	bool en;
+	int ret;
+
+	ret = kstrtobool(buf, &en);
+	if (ret)
+		return ret;
+
+	ret = i3c_hub_switch_to_i2c_channel(hub, en);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static ssize_t tp_mask_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct i3c_hub *hub = dev_get_drvdata(dev);
+	return sprintf(buf, "0x%02x\n", hub->i2c_ch.tp_mask);
+}
+
+static ssize_t tp_en_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct i3c_hub *hub = dev_get_drvdata(dev);
+	return sprintf(buf, "0x%02x\n", hub->i2c_ch.tp_en);
+}
+
+static ssize_t tp_en_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct i3c_hub *hub = dev_get_drvdata(dev);
+	u8 value;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &value);
+	if (ret)
+		return ret;
+
+	ret = i3c_hub_enable_i2c_channel_tp(hub, value);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(enable);
+static DEVICE_ATTR_RO(tp_mask);
+static DEVICE_ATTR_RW(tp_en);
+
+static struct attribute *i2c_channel_attrs[] = {
+	&dev_attr_enable.attr,
+	&dev_attr_tp_mask.attr,
+	&dev_attr_tp_en.attr,
+	NULL,
+};
+
+static const struct attribute_group i2c_channel_group = {
+	.name = "i2c_channel",
+	.attrs = i2c_channel_attrs,
+};
+
+static const struct attribute_group *i3c_hub_groups[] = {
+	&i2c_channel_group,
+	NULL,
+};
+
 static int i3c_hub_gpio_direction_input(struct gpio_chip *gc, unsigned off)
 {
 	struct i3c_hub *hub = gpiochip_get_data(gc);
@@ -2810,6 +3246,10 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 		}
 	}
 
+	ret = i3c_hub_get_i2c_channel_settings(priv);
+	if (ret)
+		dev_warn(dev, "Failed to get I2C channel settings\n");
+
 	schedule_delayed_work(&priv->delayed_work, msecs_to_jiffies(100));
 
 	return 0;
@@ -2854,7 +3294,10 @@ static void i3c_hub_remove(struct i3c_device *i3cdev)
 }
 
 static struct i3c_driver i3c_hub = {
-	.driver.name = "rts490xa-i3c-hub",
+	.driver = {
+		.name = "rts490xa-i3c-hub",
+		.dev_groups = i3c_hub_groups,
+	},
 	.id_table = i3c_hub_ids,
 	.probe = i3c_hub_probe,
 	.remove = i3c_hub_remove,
