@@ -108,6 +108,7 @@
 #define LDO_VOLTAGE_1_8V	   0x03
 
 #define I3C_HUB_TP_IO_MODE_CONF	 0x17
+#define TPn_IO_MODE_CON(n)	 BIT(n)
 #define I3C_HUB_TP_SMBUS_AGNT_EN 0x18
 #define TPn_SMBUS_MODE_EN(n)	 BIT(n)
 
@@ -271,6 +272,11 @@
 #define I3C_HUB_DT_TP_PULLUP_ENABLED	 0x01
 #define I3C_HUB_DT_TP_PULLUP_NOT_DEFINED 0xFF
 
+/* TP IO mode */
+#define I3C_HUB_DT_TP_IO_MODE_OD_PP	  0x00
+#define I3C_HUB_DT_TP_IO_MODE_OD	  0x01
+#define I3C_HUB_DT_TP_IO_MODE_NOT_DEFINED 0xFF
+
 /* CP/TP IO strength */
 #define I3C_HUB_DT_IO_STRENGTH_20_OHM	   0x00
 #define I3C_HUB_DT_IO_STRENGTH_30_OHM	   0x01
@@ -349,6 +355,7 @@ static const struct i3c_hub_dev_info i3c_hub_dev_info_table[] = {
 struct tp_setting {
 	u8 mode;
 	u8 pullup_en;
+	u8 io_mode;
 	bool always_enable;
 };
 
@@ -469,6 +476,11 @@ static const struct hub_setting tp_pullup_settings[] = {
 	{ "enabled", I3C_HUB_DT_TP_PULLUP_ENABLED },
 };
 
+static const struct hub_setting tp_io_mode_settings[] = {
+	{ "od-pp", I3C_HUB_DT_TP_IO_MODE_OD_PP },
+	{ "od", I3C_HUB_DT_TP_IO_MODE_OD },
+};
+
 static const struct hub_setting io_strength_settings[] = {
 	{ "20Ohms", I3C_HUB_DT_IO_STRENGTH_20_OHM },
 	{ "30Ohms", I3C_HUB_DT_IO_STRENGTH_30_OHM },
@@ -586,6 +598,10 @@ static void i3c_hub_tp_of_get_setting(struct device *dev,
 				       tp_pullup_settings,
 				       ARRAY_SIZE(tp_pullup_settings),
 				       &tp_setting[id].pullup_en);
+		i3c_hub_of_get_setting(dev, tp_node, "io-mode",
+				       tp_io_mode_settings,
+				       ARRAY_SIZE(tp_io_mode_settings),
+				       &tp_setting[id].io_mode);
 		tp_setting[id].always_enable =
 			of_property_read_bool(tp_node, "always-enable");
 	}
@@ -717,6 +733,8 @@ static void i3c_hub_of_default_configuration(struct device *dev)
 		priv->settings.tp[id].mode = I3C_HUB_DT_TP_MODE_NOT_DEFINED;
 		priv->settings.tp[id].pullup_en =
 			I3C_HUB_DT_TP_PULLUP_NOT_DEFINED;
+		priv->settings.tp[id].io_mode =
+			I3C_HUB_DT_TP_IO_MODE_NOT_DEFINED;
 	}
 }
 
@@ -882,6 +900,7 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 	u8 smbus_mask = 0, smbus_val = 0;
 	u8 gpio_mask = 0, gpio_val = 0;
 	u8 i3c_mask = 0, i3c_val = 0;
+	u8 io_mode_mask = 0, io_mode_val = 0;
 	int ret;
 	int i, index;
 
@@ -913,10 +932,21 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 			    I3C_HUB_DT_TP_PULLUP_ENABLED)
 				pullup_val |= TPn_PULLUP_EN(i);
 		}
+		if (priv->settings.tp[i].io_mode !=
+		    I3C_HUB_DT_TP_IO_MODE_NOT_DEFINED) {
+			io_mode_mask |= TPn_IO_MODE_CON(i);
+			if (priv->settings.tp[i].io_mode ==
+			    I3C_HUB_DT_TP_IO_MODE_OD)
+				io_mode_val |= TPn_IO_MODE_CON(i);
+		} else if (priv->settings.tp[i].mode ==
+			   I3C_HUB_DT_TP_MODE_SMBUS) {
+			io_mode_mask |= TPn_IO_MODE_CON(i);
+			io_mode_val |= TPn_IO_MODE_CON(i);
+		}
 	}
 
 	ret = regmap_update_bits(priv->regmap, I3C_HUB_TP_IO_MODE_CONF,
-				 smbus_mask, smbus_val);
+				 io_mode_mask, io_mode_val);
 	if (ret)
 		return ret;
 
@@ -1295,6 +1325,9 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 		sprintf(file_name, "tp%i.pullup_en", i);
 		debugfs_create_u8(file_name, 0400, dt_conf_dir,
 				  &settings->tp[i].pullup_en);
+		sprintf(file_name, "tp%i.io_mode", i);
+		debugfs_create_u8(file_name, 0400, dt_conf_dir,
+				  &settings->tp[i].io_mode);
 	}
 
 	entry = debugfs_create_dir("reg", priv->debug_dir);
