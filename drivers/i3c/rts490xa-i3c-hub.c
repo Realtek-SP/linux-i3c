@@ -910,6 +910,7 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 			i3c_mask |= TPn_NET_CON(i);
 			smbus_mask |= TPn_SMBUS_MODE_EN(i);
 			gpio_mask |= TPn_GPIO_MODE_EN(i);
+			io_mode_mask |= TPn_IO_MODE_CON(i);
 
 			if (priv->settings.tp[i].mode ==
 			    I3C_HUB_DT_TP_MODE_I3C) {
@@ -934,13 +935,11 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 		}
 		if (priv->settings.tp[i].io_mode !=
 		    I3C_HUB_DT_TP_IO_MODE_NOT_DEFINED) {
-			io_mode_mask |= TPn_IO_MODE_CON(i);
 			if (priv->settings.tp[i].io_mode ==
 			    I3C_HUB_DT_TP_IO_MODE_OD)
 				io_mode_val |= TPn_IO_MODE_CON(i);
 		} else if (priv->settings.tp[i].mode ==
 			   I3C_HUB_DT_TP_MODE_SMBUS) {
-			io_mode_mask |= TPn_IO_MODE_CON(i);
 			io_mode_val |= TPn_IO_MODE_CON(i);
 		}
 	}
