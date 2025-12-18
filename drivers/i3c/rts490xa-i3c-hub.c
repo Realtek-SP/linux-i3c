@@ -306,7 +306,7 @@
 #define I3C_HUB_ID_CP_SEL     0x01
 
 /* IBI */
-#define IBI_MAX_PAYLOAD_LEN 16
+#define IBI_MAX_PAYLOAD_LEN 2
 #define IBI_SLOT_NUMS	    4
 
 #define I3C_HUB_IO_CTRL_PAGE			0x81
