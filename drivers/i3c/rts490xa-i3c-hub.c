@@ -327,6 +327,10 @@
 #define I3C_HUB_EFUSE_OFFSET_A3	  0xA3
 #define I3C_HUB_FAST_DRV_LOOP_DIS BIT(5)
 
+#define I3C_HUB_EFUSE_OFFSET_9D 0x9D
+#define I3C_HUB_TP_OD_VOL_LEVEL BIT(0)
+#define I3C_HUB_TP_OD_VREF	BIT(1)
+
 #define I3C_HUB_EFUSE_OFFSET_9E		  0x9E
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_MASK GENMASK(5, 4)
 #define I3C_HUB_FAST_DRV_H_ADD_CYCLE_VAL(x) \
@@ -380,6 +384,8 @@ struct dt_settings {
 	bool handshake_optimize;
 	u8 fast_drv_h_add_cycles;
 	bool fast_rson_en;
+	bool tp_od_vol_optimize;
+	bool tp_od_vref_optimize;
 };
 
 struct smbus_backend {
@@ -676,6 +682,12 @@ static void i3c_hub_of_get_conf_static(struct device *dev,
 
 	priv->settings.fast_rson_en =
 		of_property_read_bool(node, "fast-rson-en");
+
+	priv->settings.tp_od_vol_optimize =
+		of_property_read_bool(node, "tp-od-vol-optimize");
+
+	priv->settings.tp_od_vref_optimize =
+		of_property_read_bool(node, "tp-od-vref-optimize");
 }
 
 static const struct i3c_hub_dev_info *
@@ -728,6 +740,8 @@ static void i3c_hub_of_default_configuration(struct device *dev)
 	priv->settings.handshake_optimize = false;
 	priv->settings.fast_drv_h_add_cycles = 3;
 	priv->settings.fast_rson_en = false;
+	priv->settings.tp_od_vol_optimize = false;
+	priv->settings.tp_od_vref_optimize = false;
 
 	for (id = 0; id < I3C_HUB_TP_MAX_COUNT; ++id) {
 		priv->settings.tp[id].mode = I3C_HUB_DT_TP_MODE_NOT_DEFINED;
@@ -1047,6 +1061,22 @@ static int i3c_hub_cfg_op_fuse_latch(struct i3c_hub *priv)
 	if (ret)
 		return ret;
 
+	if (priv->settings.tp_od_vol_optimize) {
+		ret = regmap_update_bits(priv->regmap, I3C_HUB_EFUSE_OFFSET_9D,
+					 I3C_HUB_TP_OD_VOL_LEVEL,
+					 I3C_HUB_TP_OD_VOL_LEVEL);
+		if (ret)
+			return ret;
+	}
+
+	if (priv->settings.tp_od_vref_optimize) {
+		ret = regmap_update_bits(priv->regmap, I3C_HUB_EFUSE_OFFSET_9D,
+					 I3C_HUB_TP_OD_VREF,
+					 I3C_HUB_TP_OD_VREF);
+		if (ret)
+			return ret;
+	}
+
 	ret = regmap_update_bits(priv->regmap, I3C_HUB_EFUSE_OFFSET_9E,
 				 I3C_HUB_FAST_DRV_H_ADD_CYCLE_MASK,
 				 I3C_HUB_FAST_DRV_H_ADD_CYCLE_VAL(
@@ -1314,6 +1344,10 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 			  &settings->fast_drv_h_add_cycles);
 	debugfs_create_bool("fast-rson-en", 0400, dt_conf_dir,
 			    &settings->fast_rson_en);
+	debugfs_create_bool("tp-od-vol-optimize", 0400, dt_conf_dir,
+			    &settings->tp_od_vol_optimize);
+	debugfs_create_bool("tp-od-vref-optimize", 0400, dt_conf_dir,
+			    &settings->tp_od_vref_optimize);
 
 	for (i = 0; i < priv->dev_info->n_ports; ++i) {
 		char file_name[32];
