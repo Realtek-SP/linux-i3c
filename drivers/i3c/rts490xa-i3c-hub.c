@@ -2122,12 +2122,6 @@ static bool backend_is_empty(struct i2c_adapter_group *g_adap,
 	if (!list_empty(&g_adap->backend_entry))
 		return false;
 
-	list_for_each_entry_safe(client, next, &adap->userspace_clients,
-				 detected) {
-		if (!strcmp(client->name, "slave-mqueue"))
-			return false;
-	}
-
 	return true;
 }
 
@@ -2181,9 +2175,7 @@ static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
 		adap = &priv->logical_bus[g_adap->tp_port].controller.i2c;
 		list_for_each_entry_safe(client, next, &adap->userspace_clients,
 					 detected) {
-			if (client->addr == address >> 1 &&
-			    (!strcmp(client->name, "slave-mqueue") ||
-			     !strcmp(client->name, "mctp-i2c-controller"))) {
+			if (client->addr == address >> 1) {
 				ret = send_to_backend(client, address,
 						      local_buffer, len);
 				if (ret) {
@@ -2428,10 +2420,6 @@ static int read_backend_from_i3c_hub_dts(struct device_node *i3c_node_target,
 					      &compatible);
 		if (ret)
 			return ret;
-
-		/* Currently only the slave-mqueue backend is supported */
-		if (strcmp("slave-mqueue", compatible))
-			return -EINVAL;
 
 		backend = kzalloc(sizeof(*backend), GFP_KERNEL);
 		if (!backend)
