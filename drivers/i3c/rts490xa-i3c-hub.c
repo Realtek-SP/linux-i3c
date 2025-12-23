@@ -2333,12 +2333,6 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 	struct device *dev = i3cdev_to_dev(priv->i3cdev);
 	int ret;
 
-	if (priv->hub_dt_cp1_id != -1 &&
-	    priv->hub_dt_cp1_id != priv->hub_pin_cp1_id) {
-		dev_warn(dev, "hub_dt_cp1_id not equal to hub_pin_cp1_id!\n");
-		return 1;
-	}
-
 	priv->logical_bus[i].priv = priv;
 	priv->logical_bus[i].smbus_port_adapter.tp_port = i;
 	priv->logical_bus[i].smbus_port_adapter.tp_mask = BIT(i);
