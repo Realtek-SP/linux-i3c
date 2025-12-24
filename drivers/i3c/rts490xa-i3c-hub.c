@@ -396,9 +396,12 @@ struct smbus_backend {
 };
 
 struct i2c_adapter_group {
+	struct i2c_adapter i2c;
 	u8 tp_mask;
 	u8 tp_port;
 	u8 used;
+	struct device_node *of_node;
+	struct i3c_hub *priv;
 
 	struct delayed_work delayed_work_polling;
 	struct list_head backend_entry;
@@ -411,7 +414,6 @@ struct logical_bus {
 	u8 tp_id;
 	u8 tp_map;
 	struct i3c_master_controller controller;
-	struct i2c_adapter_group smbus_port_adapter;
 	struct device_node *of_node;
 	struct i3c_hub *priv;
 };
@@ -437,6 +439,7 @@ struct i3c_hub {
 	int hub_dt_cp1_id;
 
 	struct logical_bus logical_bus[I3C_HUB_TP_MAX_COUNT];
+	struct i2c_adapter_group smbus_port_adapter[I3C_HUB_TP_MAX_COUNT];
 	struct mutex page_mutex;
 
 	/* Offset for reading HUB's register. */
@@ -1633,11 +1636,8 @@ static int i3c_controller_smbus_port_adapter_xfer(struct i2c_adapter *adap,
 						  struct i2c_msg *xfers,
 						  int nxfers)
 {
-	struct i3c_master_controller *controller =
-		container_of(adap, struct i3c_master_controller, i2c);
-	struct logical_bus *bus =
-		container_of(controller, struct logical_bus, controller);
-	struct i3c_hub *priv = bus->priv;
+	struct i2c_adapter_group *smbus = i2c_get_adapdata(adap);
+	struct i3c_hub *priv = smbus->priv;
 	int ret_sum = 0;
 	int ret;
 	u8 return_status;
@@ -1654,9 +1654,8 @@ static int i3c_controller_smbus_port_adapter_xfer(struct i2c_adapter *adap,
 
 		rw = xfers[nxfers_i].flags % 2;
 
-		ret = i3c_hub_smbus_msg(priv, xfers,
-					bus->smbus_port_adapter.tp_port,
-					nxfers_i, rw, &return_status);
+		ret = i3c_hub_smbus_msg(priv, xfers, smbus->tp_port, nxfers_i,
+					rw, &return_status);
 		if (ret)
 			return ret;
 		if (return_status == I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG)
@@ -1922,52 +1921,10 @@ static const struct i3c_master_controller_ops i3c_hub_i3c_ops = {
 	.recycle_ibi_slot = i3c_hub_recycle_ibi_slot,
 };
 
-/* SMBus virtual i3c_master_controller_ops */
-
-static int i3c_hub_do_daa_smbus(struct i3c_master_controller *controller)
-{
-	return 0;
-}
-
-static int i3c_hub_send_ccc_cmd_smbus(struct i3c_master_controller *controller,
-				      struct i3c_ccc_cmd *cmd)
-{
-	return 0;
-}
-
-static int i3c_hub_priv_xfers_smbus(struct i3c_dev_desc *dev,
-				    struct i3c_priv_xfer *xfers, int nxfers)
-{
-	return 0;
-}
-
-static int i3c_hub_i2c_xfers_smbus(struct i2c_dev_desc *dev,
-				   struct i2c_msg *xfers, int nxfers)
-{
-	return 0;
-}
-
-static const struct i3c_master_controller_ops i3c_hub_i3c_ops_smbus = {
-	.bus_init = i3c_hub_bus_init,
-	.bus_cleanup = i3c_hub_bus_cleanup,
-	.do_daa = i3c_hub_do_daa_smbus,
-	.send_ccc_cmd = i3c_hub_send_ccc_cmd_smbus,
-	.priv_xfers = i3c_hub_priv_xfers_smbus,
-	.i2c_xfers = i3c_hub_i2c_xfers_smbus,
-};
-
 static int i3c_hub_logic_register(struct i3c_master_controller *controller,
 				  struct device *parent)
 {
 	return i3c_master_register(controller, parent, &i3c_hub_i3c_ops, false);
-}
-
-static int
-i3c_hub_logic_register_smbus(struct i3c_master_controller *controller,
-			     struct device *parent)
-{
-	return i3c_master_register(controller, parent, &i3c_hub_i3c_ops_smbus,
-				   false);
 }
 
 static u32 i3c_controller_smbus_funcs(struct i2c_adapter *adapter)
@@ -2000,6 +1957,7 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 	struct i2c_board_info host_notify_board_info = { 0 };
 	struct smbus_backend *backend = NULL;
 	struct logical_bus *bus;
+	struct i2c_adapter_group *smbus;
 	int ret;
 	int i;
 	unsigned int reg_val = 0;
@@ -2069,21 +2027,18 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 	}
 
 	for (i = 0; i < priv->dev_info->n_ports; i++) {
-		bus = &priv->logical_bus[i];
-		if (!bus->smbus_port_adapter.used)
+		smbus = &priv->smbus_port_adapter[i];
+		if (!smbus->used)
 			continue;
 
-		bus->controller.i2c.algo = &i3c_controller_smbus_algo;
-
-		list_for_each_entry(
-			backend, &bus->smbus_port_adapter.backend_entry, list) {
+		list_for_each_entry(backend, &smbus->backend_entry, list) {
 			host_notify_board_info.addr = backend->addr;
 			host_notify_board_info.flags = I2C_CLIENT_SLAVE;
 			snprintf(host_notify_board_info.type, I2C_NAME_SIZE,
 				 backend->compatible);
 
 			backend->client = i2c_new_client_device(
-				&bus->controller.i2c, &host_notify_board_info);
+				&smbus->i2c, &host_notify_board_info);
 			if (IS_ERR(backend->client)) {
 				dev_warn(dev,
 					 "Error while registering backend\n");
@@ -2092,25 +2047,9 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 		}
 
 		schedule_delayed_work(
-			&bus->smbus_port_adapter.delayed_work_polling,
+			&smbus->delayed_work_polling,
 			msecs_to_jiffies(I3C_HUB_POLLING_ROLL_PERIOD_MS));
 	}
-}
-
-static int i3c_hub_register_smbus_controller(struct i3c_hub *priv, int i)
-{
-	struct device *dev = i3cdev_to_dev(priv->i3cdev);
-	int ret;
-
-	dev->of_node = priv->logical_bus[i].of_node;
-	ret = i3c_hub_logic_register_smbus(&priv->logical_bus[i].controller,
-					   dev);
-	if (ret) {
-		dev_warn(dev, "Failed to register i3c controller\n");
-		return ret;
-	}
-
-	return 0;
 }
 
 /* return true when backend is empty */
@@ -2172,7 +2111,7 @@ static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
 	}
 
 	if (!found_backend) {
-		adap = &priv->logical_bus[g_adap->tp_port].controller.i2c;
+		adap = &priv->smbus_port_adapter[g_adap->tp_port].i2c;
 		list_for_each_entry_safe(client, next, &adap->userspace_clients,
 					 detected) {
 			if (client->addr == address >> 1) {
@@ -2244,21 +2183,17 @@ static void i3c_hub_delayed_work_polling(struct work_struct *work)
 {
 	struct i2c_adapter_group *g_adap =
 		container_of(work, typeof(*g_adap), delayed_work_polling.work);
-	struct logical_bus *bus =
-		container_of(g_adap, struct logical_bus, smbus_port_adapter);
+	struct i3c_hub *priv = g_adap->priv;
 	u8 controller_buffer_page =
 		I3C_HUB_CONTROLLER_BUFFER_PAGE + 4 * g_adap->tp_port;
 	u8 target_port_status = I3C_HUB_TP0_SMBUS_AGNT_STS + g_adap->tp_port;
 	u8 local_buffer[I3C_HUB_SMBUS_TARGET_PAYLOAD_SIZE] = { 0 };
-	u8 target_buffer_page, address, len, flag;
-	struct i3c_hub *priv = bus->priv;
+	u8 target_buffer_page, address = 0, len = 0, flag;
 	struct device *dev = i3cdev_to_dev(priv->i3cdev);
 	u32 status;
 	int ret;
 
-	if (backend_is_empty(
-		    g_adap,
-		    &priv->logical_bus[g_adap->tp_port].controller.i2c)) {
+	if (backend_is_empty(g_adap, &g_adap->i2c)) {
 		schedule_delayed_work(
 			&g_adap->delayed_work_polling,
 			msecs_to_jiffies(I3C_HUB_POLLING_ROLL_PERIOD_MS));
@@ -2332,32 +2267,32 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 {
 	struct device *dev = i3cdev_to_dev(priv->i3cdev);
 	int ret;
+	struct i2c_adapter_group *smbus = &priv->smbus_port_adapter[i];
+	struct i2c_adapter *i2c = &smbus->i2c;
 
-	priv->logical_bus[i].priv = priv;
-	priv->logical_bus[i].smbus_port_adapter.tp_port = i;
-	priv->logical_bus[i].smbus_port_adapter.tp_mask = BIT(i);
+	smbus->priv = priv;
+	smbus->tp_port = i;
+	smbus->tp_mask = BIT(i);
 
-	/* Register controller for target port */
-	ret = i3c_hub_register_smbus_controller(priv, i);
+	i2c->owner = THIS_MODULE;
+	i2c->algo = &i3c_controller_smbus_algo;
+	i2c->dev.parent = dev;
+	i2c->dev.of_node = smbus->of_node;
+	i2c->timeout = 1000;
+	i2c->retries = 3;
+	snprintf(i2c->name, sizeof(i2c->name), "hub%s.port%d", dev_name(dev),
+		 smbus->tp_port);
+
+	i2c_set_adapdata(i2c, smbus);
+
+	ret = i2c_add_adapter(i2c);
 	if (ret)
 		return ret;
 
-	priv->logical_bus[i].smbus_port_adapter.used = 1;
+	smbus->used = 1;
 
-	INIT_DELAYED_WORK(
-		&priv->logical_bus[i].smbus_port_adapter.delayed_work_polling,
-		i3c_hub_delayed_work_polling);
-
-	priv->logical_bus[i].controller.i2c.dev.parent =
-		priv->logical_bus[i].controller.dev.parent;
-	priv->logical_bus[i].controller.i2c.owner =
-		priv->logical_bus[i].controller.dev.parent->driver->owner;
-
-	sprintf(priv->logical_bus[i].controller.i2c.name, "hub%s.port%d",
-		dev_name(&priv->i3cdev->dev), i);
-
-	priv->logical_bus[i].controller.i2c.timeout = 1000;
-	priv->logical_bus[i].controller.i2c.retries = 3;
+	INIT_DELAYED_WORK(&smbus->delayed_work_polling,
+			  i3c_hub_delayed_work_polling);
 
 	return 0;
 }
@@ -2368,9 +2303,7 @@ static bool backend_node_is_exist(int port, struct i3c_hub *priv, u32 addr)
 	struct smbus_backend *backend = NULL;
 
 	list_for_each_entry(
-		backend,
-		&priv->logical_bus[port].smbus_port_adapter.backend_entry,
-		list) {
+		backend, &priv->smbus_port_adapter[port].backend_entry, list) {
 		if (backend->addr == addr)
 			return true;
 	}
@@ -2396,8 +2329,8 @@ static int read_backend_from_i3c_hub_dts(struct device_node *i3c_node_target,
 	if (tp_port < 0)
 		return -EINVAL;
 
-	INIT_LIST_HEAD(
-		&priv->logical_bus[tp_port].smbus_port_adapter.backend_entry);
+	priv->smbus_port_adapter[tp_port].of_node = i3c_node_target;
+	INIT_LIST_HEAD(&priv->smbus_port_adapter[tp_port].backend_entry);
 	for_each_available_child_of_node(i3c_node_target, i3c_node_tp) {
 		if (strcmp(i3c_node_tp->name, "backend"))
 			continue;
@@ -2422,8 +2355,7 @@ static int read_backend_from_i3c_hub_dts(struct device_node *i3c_node_target,
 		backend->addr = addr_dts;
 		backend->compatible = compatible;
 		list_add(&backend->list,
-			 &priv->logical_bus[tp_port]
-				  .smbus_port_adapter.backend_entry);
+			 &priv->smbus_port_adapter[tp_port].backend_entry);
 	}
 
 	return 0;
@@ -2834,7 +2766,7 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 
 	/* Register logic for native smbus ports */
 	for (i = 0; i < priv->dev_info->n_ports; i++) {
-		priv->logical_bus[i].smbus_port_adapter.used = 0;
+		priv->smbus_port_adapter[i].used = 0;
 		if (priv->settings.tp[i].mode == I3C_HUB_DT_TP_MODE_SMBUS)
 			ret = i3c_hub_smbus_tp_algo(priv, i);
 	}
@@ -2906,8 +2838,8 @@ static void i3c_hub_remove(struct i3c_device *i3cdev)
 	i3c_device_free_ibi(i3cdev);
 
 	for (i = 0; i < priv->dev_info->n_ports; i++) {
-		if (priv->logical_bus[i].smbus_port_adapter.used) {
-			g_adap = &priv->logical_bus[i].smbus_port_adapter;
+		if (priv->smbus_port_adapter[i].used) {
+			g_adap = &priv->smbus_port_adapter[i];
 			cancel_delayed_work_sync(&g_adap->delayed_work_polling);
 			list_for_each_entry(backend, &g_adap->backend_entry,
 					    list) {
@@ -2916,8 +2848,10 @@ static void i3c_hub_remove(struct i3c_device *i3cdev)
 			}
 		}
 
-		if (priv->logical_bus[i].smbus_port_adapter.used ||
-		    priv->logical_bus[i].registered)
+		if (priv->smbus_port_adapter[i].used)
+			i2c_del_adapter(&priv->smbus_port_adapter[i].i2c);
+
+		if (priv->logical_bus[i].registered)
 			i3c_master_unregister(&priv->logical_bus[i].controller);
 	}
 
