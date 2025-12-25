@@ -390,8 +390,6 @@ struct dt_settings {
 
 struct smbus_backend {
 	struct i2c_client *client;
-	const char *compatible;
-	int addr;
 	struct list_head list;
 };
 
@@ -402,6 +400,7 @@ struct i2c_adapter_group {
 	u8 used;
 	struct device_node *of_node;
 	struct i3c_hub *priv;
+	struct mutex mutex;
 
 	struct delayed_work delayed_work_polling;
 	struct list_head backend_entry;
@@ -600,6 +599,8 @@ static void i3c_hub_tp_of_get_setting(struct device *dev,
 				 id);
 			continue;
 		}
+
+		priv->smbus_port_adapter[id].of_node = tp_node;
 		i3c_hub_of_get_setting(dev, tp_node, "mode", tp_mode_settings,
 				       ARRAY_SIZE(tp_mode_settings),
 				       &tp_setting[id].mode);
@@ -1934,12 +1935,58 @@ static u32 i3c_controller_smbus_funcs(struct i2c_adapter *adapter)
 
 static int reg_i2c_target(struct i2c_client *client)
 {
-	return 0;
+	struct i2c_adapter_group *smbus = i2c_get_adapdata(client->adapter);
+	struct smbus_backend *backend;
+	int ret = 0;
+
+	if (!smbus)
+		return -EINVAL;
+
+	mutex_lock(&smbus->mutex);
+
+	list_for_each_entry(backend, &smbus->backend_entry, list) {
+		if (backend->client->addr == client->addr) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+
+	backend = kzalloc(sizeof(*backend), GFP_KERNEL);
+	if (!backend) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	backend->client = client;
+	list_add(&backend->list, &smbus->backend_entry);
+
+out:
+	mutex_unlock(&smbus->mutex);
+	return ret;
 }
 
 static int unreg_i2c_target(struct i2c_client *client)
 {
-	return 0;
+	struct i2c_adapter_group *smbus = i2c_get_adapdata(client->adapter);
+	struct smbus_backend *backend;
+	bool found = false;
+
+	if (!smbus)
+		return -EINVAL;
+
+	mutex_lock(&smbus->mutex);
+
+	list_for_each_entry(backend, &smbus->backend_entry, list) {
+		if (backend->client->addr == client->addr) {
+			list_del(&backend->list);
+			kfree(backend);
+			found = true;
+			break;
+		}
+	}
+
+	mutex_unlock(&smbus->mutex);
+	return found ? 0 : -ENODEV;
 }
 
 static const struct i2c_algorithm i3c_controller_smbus_algo = {
@@ -1954,8 +2001,6 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 	struct i3c_hub *priv =
 		container_of(work, typeof(*priv), delayed_work.work);
 	struct device *dev = i3cdev_to_dev(priv->i3cdev);
-	struct i2c_board_info host_notify_board_info = { 0 };
-	struct smbus_backend *backend = NULL;
 	struct logical_bus *bus;
 	struct i2c_adapter_group *smbus;
 	int ret;
@@ -2031,57 +2076,10 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 		if (!smbus->used)
 			continue;
 
-		list_for_each_entry(backend, &smbus->backend_entry, list) {
-			host_notify_board_info.addr = backend->addr;
-			host_notify_board_info.flags = I2C_CLIENT_SLAVE;
-			snprintf(host_notify_board_info.type, I2C_NAME_SIZE,
-				 backend->compatible);
-
-			backend->client = i2c_new_client_device(
-				&smbus->i2c, &host_notify_board_info);
-			if (IS_ERR(backend->client)) {
-				dev_warn(dev,
-					 "Error while registering backend\n");
-				return;
-			}
-		}
-
 		schedule_delayed_work(
 			&smbus->delayed_work_polling,
 			msecs_to_jiffies(I3C_HUB_POLLING_ROLL_PERIOD_MS));
 	}
-}
-
-/* return true when backend is empty */
-static bool backend_is_empty(struct i2c_adapter_group *g_adap,
-			     struct i2c_adapter *adap)
-{
-	struct i2c_client *client, *next;
-
-	if (!list_empty(&g_adap->backend_entry))
-		return false;
-
-	return true;
-}
-
-static int send_to_backend(struct i2c_client *client, u8 address, u8 *val,
-			   u8 len)
-{
-	int i, ret;
-	u8 tmp;
-
-	ret = i2c_slave_event(client, I2C_SLAVE_WRITE_REQUESTED, &address);
-	if (ret)
-		return ret;
-
-	for (i = 0; i < len; i++) {
-		ret = i2c_slave_event(client, I2C_SLAVE_WRITE_RECEIVED,
-				      &val[i]);
-		if (ret)
-			return ret;
-	}
-
-	return i2c_slave_event(client, I2C_SLAVE_STOP, &tmp);
 }
 
 static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
@@ -2089,46 +2087,36 @@ static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
 					     u8 address, u8 *local_buffer,
 					     u8 len)
 {
-	struct device *dev = i3cdev_to_dev(priv->i3cdev);
 	struct smbus_backend *backend;
-	struct i2c_client *client, *next;
-	struct i2c_adapter *adap;
-	bool found_backend = false;
-	int ret;
+	struct i2c_client *client;
+	int i, ret;
+	u8 tmp;
+
+	mutex_lock(&g_adap->mutex);
 
 	list_for_each_entry(backend, &g_adap->backend_entry, list) {
-		if (address >> 1 == backend->addr) {
-			ret = send_to_backend(backend->client, address,
-					      local_buffer, len);
-			if (ret) {
-				dev_err(dev, "Failed to send to backend: %d\n",
-					ret);
+		client = backend->client;
+		if (client->addr == address >> 1) {
+			mutex_unlock(&g_adap->mutex);
+			ret = i2c_slave_event(client, I2C_SLAVE_WRITE_REQUESTED,
+					      &address);
+			if (ret)
 				return ret;
-			}
-			found_backend = true;
-			break;
-		}
-	}
 
-	if (!found_backend) {
-		adap = &priv->smbus_port_adapter[g_adap->tp_port].i2c;
-		list_for_each_entry_safe(client, next, &adap->userspace_clients,
-					 detected) {
-			if (client->addr == address >> 1) {
-				ret = send_to_backend(client, address,
-						      local_buffer, len);
-				if (ret) {
-					dev_err(dev,
-						"Failed to send to userspace client: %d\n",
-						ret);
+			for (i = 0; i < len; i++) {
+				ret = i2c_slave_event(client,
+						      I2C_SLAVE_WRITE_RECEIVED,
+						      &local_buffer[i]);
+				if (ret)
 					return ret;
-				}
-				break;
 			}
+
+			return i2c_slave_event(client, I2C_SLAVE_STOP, &tmp);
 		}
 	}
 
-	return 0;
+	mutex_unlock(&g_adap->mutex);
+	return -ENXIO;
 }
 
 static int read_smbus_target_buffer_page(struct i3c_hub *priv,
@@ -2173,9 +2161,8 @@ error:
 
 /**
  * i3c_hub_delayed_work_polling() - This delayed work is a polling mechanism to
- * find if any transaction happened. After a transaction was found it is saved with
- * the slave-mqueue backend and can be read from the fs. Controller buffer page is
- * determined by adding the first buffer page number to port index multiplied by four.
+ * find if any transaction happened. Controller buffer page is determined by adding
+ * the first buffer page number to port index multiplied by four.
  * The two target buffer page numbers are determined the same way but they are offset
  * by 2 and 3 from the controller page.
  */
@@ -2193,12 +2180,8 @@ static void i3c_hub_delayed_work_polling(struct work_struct *work)
 	u32 status;
 	int ret;
 
-	if (backend_is_empty(g_adap, &g_adap->i2c)) {
-		schedule_delayed_work(
-			&g_adap->delayed_work_polling,
-			msecs_to_jiffies(I3C_HUB_POLLING_ROLL_PERIOD_MS));
+	if (list_empty(&g_adap->backend_entry))
 		return;
-	}
 
 	ret = regmap_read(priv->regmap, target_port_status, &status);
 	if (ret) {
@@ -2270,6 +2253,8 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 	struct i2c_adapter_group *smbus = &priv->smbus_port_adapter[i];
 	struct i2c_adapter *i2c = &smbus->i2c;
 
+	mutex_init(&smbus->mutex);
+	INIT_LIST_HEAD(&smbus->backend_entry);
 	smbus->priv = priv;
 	smbus->tp_port = i;
 	smbus->tp_mask = BIT(i);
@@ -2295,99 +2280,6 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 			  i3c_hub_delayed_work_polling);
 
 	return 0;
-}
-
-/* return true when backend node exist */
-static bool backend_node_is_exist(int port, struct i3c_hub *priv, u32 addr)
-{
-	struct smbus_backend *backend = NULL;
-
-	list_for_each_entry(
-		backend, &priv->smbus_port_adapter[port].backend_entry, list) {
-		if (backend->addr == addr)
-			return true;
-	}
-
-	return false;
-}
-
-static int read_backend_from_i3c_hub_dts(struct device_node *i3c_node_target,
-					 struct i3c_hub *priv)
-{
-	struct device_node *i3c_node_tp;
-	const char *compatible;
-	int tp_port, ret;
-	u32 addr_dts;
-	struct smbus_backend *backend;
-
-	if (sscanf(i3c_node_target->full_name, "target-port@%d", &tp_port) == 0)
-		return -EINVAL;
-
-	if (tp_port > priv->dev_info->n_ports)
-		return -ERANGE;
-
-	if (tp_port < 0)
-		return -EINVAL;
-
-	priv->smbus_port_adapter[tp_port].of_node = i3c_node_target;
-	INIT_LIST_HEAD(&priv->smbus_port_adapter[tp_port].backend_entry);
-	for_each_available_child_of_node(i3c_node_target, i3c_node_tp) {
-		if (strcmp(i3c_node_tp->name, "backend"))
-			continue;
-
-		ret = of_property_read_u32(i3c_node_tp, "target-reg",
-					   &addr_dts);
-		if (ret)
-			return ret;
-
-		if (backend_node_is_exist(tp_port, priv, addr_dts))
-			continue;
-
-		ret = of_property_read_string(i3c_node_tp, "compatible",
-					      &compatible);
-		if (ret)
-			return ret;
-
-		backend = kzalloc(sizeof(*backend), GFP_KERNEL);
-		if (!backend)
-			return -ENOMEM;
-
-		backend->addr = addr_dts;
-		backend->compatible = compatible;
-		list_add(&backend->list,
-			 &priv->smbus_port_adapter[tp_port].backend_entry);
-	}
-
-	return 0;
-}
-
-/**
- * This function saves information about the i3c_hub's ports
- * working in slave mode. It takes its data from the DTs
- * (aspeed-bmc-intel-avc.dts) and saves the parameters
- * into the coresponding target port i2c_adapter_group structure
- * in the i3c_hub
- *
- * @dev: device used by i3c_hub
- * @i3c_node_hub: device node pointing to the hub
- * @priv: pointer to the i3c_hub structure
- */
-static void i3c_hub_parse_dt_tp(struct device *dev,
-				const struct device_node *i3c_node_hub,
-				struct i3c_hub *priv)
-{
-	struct device_node *i3c_node_target;
-	int ret;
-
-	for_each_available_child_of_node(i3c_node_hub, i3c_node_target) {
-		if (!strcmp(i3c_node_target->name, "target-port")) {
-			ret = read_backend_from_i3c_hub_dts(i3c_node_target,
-							    priv);
-			if (ret)
-				dev_err(dev, "DTS entry invalid - error %d",
-					ret);
-		}
-	}
 }
 
 static int i3c_hub_gpio_direction_input(struct gpio_chip *gc, unsigned off)
@@ -2751,9 +2643,6 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 		i3c_hub_of_get_conf_static(dev, node);
 		i3c_hub_of_get_conf_runtime(dev, node);
 		of_node_put(node);
-
-		/* Parse DTS to find data on the SMBus target mode */
-		i3c_hub_parse_dt_tp(dev, node, priv);
 	}
 
 	/* Unlock access to protected registers */
@@ -2830,8 +2719,6 @@ error:
 static void i3c_hub_remove(struct i3c_device *i3cdev)
 {
 	struct i3c_hub *priv = i3cdev_get_drvdata(i3cdev);
-	struct i2c_adapter_group *g_adap;
-	struct smbus_backend *backend = NULL;
 	int i;
 
 	i3c_device_disable_ibi(i3cdev);
@@ -2839,17 +2726,11 @@ static void i3c_hub_remove(struct i3c_device *i3cdev)
 
 	for (i = 0; i < priv->dev_info->n_ports; i++) {
 		if (priv->smbus_port_adapter[i].used) {
-			g_adap = &priv->smbus_port_adapter[i];
-			cancel_delayed_work_sync(&g_adap->delayed_work_polling);
-			list_for_each_entry(backend, &g_adap->backend_entry,
-					    list) {
-				i2c_unregister_device(backend->client);
-				kfree(backend);
-			}
-		}
-
-		if (priv->smbus_port_adapter[i].used)
+			cancel_delayed_work_sync(
+				&priv->smbus_port_adapter[i]
+					 .delayed_work_polling);
 			i2c_del_adapter(&priv->smbus_port_adapter[i].i2c);
+		}
 
 		if (priv->logical_bus[i].registered)
 			i3c_master_unregister(&priv->logical_bus[i].controller);

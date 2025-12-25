@@ -284,22 +284,6 @@ patternProperties:
           the devices connected to it and the port is disabled automatically after the accessing
           is done. If provided, the Target Port is always enabled.
 
-    patternProperties:
-      "@0,0$":
-        type: object
-        description: |
-          Backend for handling SMBus mode, should be named: backend@0,0
-          Adding this node installs the backed for handling SMBus Target mode communication.
-
-        properties:
-          compatible:
-            description:
-              Compatible of the I2C/SMBus backend.
-
-          target-reg:
-            description:
-              Target address used for Target Port in the I3C HUB configured as SMBus Target mode.
-
 additionalProperties: true
 
 examples:
@@ -332,9 +316,9 @@ examples:
         target-port@1 {
           mode = "smbus";
           pullup = "enabled";
-          backend@0,0{
-              compatible = "slave-mqueue";
-              target-reg = <0x10>;
+          backend@10{
+              compatible = "i2c-slave-mqueue";
+              reg = <(0x10 | I2C_OWN_SLAVE_ADDRESS)>;
           };
         };
         target-port@2 {
@@ -381,9 +365,9 @@ examples:
         target-port@1 {
           mode = "smbus";
           pullup = "enabled";
-          backend@0,0{
-              compatible = "slave-mqueue";
-              target-reg = <0x12>;
+          backend@12{
+              compatible = "i2c-slave-mqueue";
+              reg = <(0x12 | I2C_OWN_SLAVE_ADDRESS)>;
           };
         };
         target-port@2 {
