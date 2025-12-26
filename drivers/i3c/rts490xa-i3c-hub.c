@@ -1933,6 +1933,7 @@ static u32 i3c_controller_smbus_funcs(struct i2c_adapter *adapter)
 	return (I2C_FUNC_SMBUS_EMUL | I2C_FUNC_I2C) & ~I2C_FUNC_SMBUS_QUICK;
 }
 
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
 static int reg_i2c_target(struct i2c_client *client)
 {
 	struct i2c_adapter_group *smbus = i2c_get_adapdata(client->adapter);
@@ -1988,12 +1989,15 @@ static int unreg_i2c_target(struct i2c_client *client)
 	mutex_unlock(&smbus->mutex);
 	return found ? 0 : -ENODEV;
 }
+#endif /* CONFIG_I2C_SLAVE */
 
 static const struct i2c_algorithm i3c_controller_smbus_algo = {
 	.master_xfer = i3c_controller_smbus_port_adapter_xfer,
 	.functionality = i3c_controller_smbus_funcs,
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
 	.reg_slave = reg_i2c_target,
 	.unreg_slave = unreg_i2c_target,
+#endif
 };
 
 static void i3c_hub_delayed_work(struct work_struct *work)
@@ -2087,6 +2091,7 @@ static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
 					     u8 address, u8 *local_buffer,
 					     u8 len)
 {
+#if IS_ENABLED(CONFIG_I2C_SLAVE)
 	struct smbus_backend *backend;
 	struct i2c_client *client;
 	int i, ret;
@@ -2116,6 +2121,7 @@ static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
 	}
 
 	mutex_unlock(&g_adap->mutex);
+#endif /* CONFIG_I2C_SLAVE */
 	return -ENXIO;
 }
 
