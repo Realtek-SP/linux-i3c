@@ -2563,10 +2563,32 @@ static void i3c_hub_ibi_handler(struct i3c_device *dev,
 				const struct i3c_ibi_payload *payload)
 {
 	struct i3c_hub *priv = i3cdev_get_drvdata(dev);
-	int val = 0;
+	int ret, val = 0;
+	u8 status = 0;
 
-	regmap_read(priv->regmap, I3C_HUB_DEV_AND_IBI_STS, &val);
-	if (val & TP_IO_FLAG_STATUS)
+	if (!payload->len) {
+		dev_dbg(&dev->dev,
+			"Zero-length IBI payload, reading status register\n");
+		ret = regmap_read(priv->regmap, I3C_HUB_DEV_AND_IBI_STS, &val);
+		if (ret) {
+			dev_warn_ratelimited(&dev->dev,
+					     "Failed to read IBI status: %d\n",
+					     ret);
+			return;
+		}
+		status = (u8)val;
+	} else {
+		if (!payload->data) {
+			dev_warn_ratelimited(
+				&dev->dev,
+				"IBI payload data is NULL with len=%d\n",
+				payload->len);
+			return;
+		}
+		status = ((const u8 *)payload->data)[0];
+	}
+
+	if (status & TP_IO_FLAG_STATUS)
 		i3c_hub_io_ibi_handler(priv, payload);
 }
 
