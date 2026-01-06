@@ -284,6 +284,17 @@ patternProperties:
           the devices connected to it and the port is disabled automatically after the accessing
           is done. If provided, the Target Port is always enabled.
 
+      polling-interval-ms:
+        type: uint32
+        description: |
+          I3C HUB Target Port SMBus polling interval in milliseconds.
+
+          This property is optional. If not provided or set to 0, polling is disabled and the driver
+          uses IBI (In-Band Interrupts). If provided with a positive value, polling is enabled for
+          this Target Port with the given period.Note: this positive value only affects the SMBus
+          target agent polling. The SMBus controller agent polling interval is computed dynamically
+          from clock and data length.
+
 additionalProperties: true
 
 examples:
@@ -316,6 +327,7 @@ examples:
         target-port@1 {
           mode = "smbus";
           pullup = "enabled";
+          polling-interval-ms = <10>;
           backend@10{
               compatible = "i2c-slave-mqueue";
               reg = <(0x10 | I2C_OWN_SLAVE_ADDRESS)>;

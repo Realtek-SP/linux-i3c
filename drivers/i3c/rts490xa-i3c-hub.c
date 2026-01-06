@@ -284,9 +284,6 @@
 #define I3C_HUB_DT_IO_STRENGTH_50_OHM	   0x03
 #define I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED 0xFF
 
-/* SMBus polling */
-#define I3C_HUB_POLLING_ROLL_PERIOD_MS 10
-
 /* SMBus transaction types fields */
 #define I3C_HUB_SMBUS_400kHz BIT(2)
 
@@ -298,8 +295,10 @@
 	(I3C_HUB_CONTROLLER_BUFFER_SIZE - I3C_HUB_SMBUS_DESCRIPTOR_SIZE)
 #define I3C_HUB_SMBUS_TARGET_PAYLOAD_SIZE (I3C_HUB_TARGET_BUFFER_SIZE - 2)
 
-/* Hub SMBus timeout time period in nanoseconds */
-#define I3C_HUB_SMBUS_400kHz_TIMEOUT 2e8
+#define I3C_HUB_SMBUS_CLOCK_KHZ 400
+/* Hub SMBus status register read interval (microseconds, ceil) */
+#define I3C_HUB_SMBUS_STATUS_READ_INTERVAL_US_CEIL(len, clk_khz) \
+	DIV_ROUND_UP(1000U * 9U * (u32)(len), (u32)(clk_khz))
 
 /* ID Extraction */
 #define I3C_HUB_ID_CP_SDA_SCL 0x00
@@ -307,7 +306,7 @@
 
 /* IBI */
 #define IBI_MAX_PAYLOAD_LEN 2
-#define IBI_SLOT_NUMS	    4
+#define IBI_SLOT_NUMS	    6
 
 #define I3C_HUB_IO_CTRL_PAGE			0x81
 #define I3C_HUB_CFG_TP_SCL_L_ACK_CLK		0xDB
@@ -361,6 +360,7 @@ struct tp_setting {
 	u8 pullup_en;
 	u8 io_mode;
 	bool always_enable;
+	u32 poll_interval_ms;
 };
 
 struct dt_settings {
@@ -405,6 +405,9 @@ struct i2c_adapter_group {
 	struct delayed_work delayed_work_polling;
 	struct list_head backend_entry;
 	u8 last_processed_buf;
+
+	u8 status;
+	struct completion completion;
 };
 
 struct logical_bus {
@@ -439,6 +442,7 @@ struct i3c_hub {
 
 	struct logical_bus logical_bus[I3C_HUB_TP_MAX_COUNT];
 	struct i2c_adapter_group smbus_port_adapter[I3C_HUB_TP_MAX_COUNT];
+	u8 smbus_ibi_en_mask;
 	struct mutex page_mutex;
 
 	/* Offset for reading HUB's register. */
@@ -579,7 +583,7 @@ static void i3c_hub_tp_of_get_setting(struct device *dev,
 {
 	struct i3c_hub *priv = dev_get_drvdata(dev);
 	struct device_node *tp_node;
-	u32 id;
+	u32 id, val;
 
 	for_each_available_child_of_node(node, tp_node) {
 		if (!tp_node->name || of_node_cmp(tp_node->name, "target-port"))
@@ -614,6 +618,8 @@ static void i3c_hub_tp_of_get_setting(struct device *dev,
 				       &tp_setting[id].io_mode);
 		tp_setting[id].always_enable =
 			of_property_read_bool(tp_node, "always-enable");
+		if (!of_property_read_u32(tp_node, "polling-interval-ms", &val))
+			tp_setting[id].poll_interval_ms = val;
 	}
 }
 
@@ -753,6 +759,7 @@ static void i3c_hub_of_default_configuration(struct device *dev)
 			I3C_HUB_DT_TP_PULLUP_NOT_DEFINED;
 		priv->settings.tp[id].io_mode =
 			I3C_HUB_DT_TP_IO_MODE_NOT_DEFINED;
+		priv->settings.tp[id].poll_interval_ms = 0;
 	}
 }
 
@@ -1365,6 +1372,9 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 		sprintf(file_name, "tp%i.io_mode", i);
 		debugfs_create_u8(file_name, 0400, dt_conf_dir,
 				  &settings->tp[i].io_mode);
+		sprintf(file_name, "tp%i.poll_interval_ms", i);
+		debugfs_create_u32(file_name, 0400, dt_conf_dir,
+				   &settings->tp[i].poll_interval_ms);
 	}
 
 	entry = debugfs_create_dir("reg", priv->debug_dir);
@@ -1477,42 +1487,58 @@ static void restore_i3c_i2c_desc_parent(struct i3c_i2c_dev_desc *desc,
 	desc->master = parent;
 }
 
-static int i3c_hub_read_transaction_status(struct i3c_hub *priv,
-					   u8 target_port_status, u8 *status)
+static int i3c_hub_read_transaction_status(struct i3c_hub *priv, u8 target_port,
+					   u8 target_port_status, u8 *status,
+					   u32 data_len)
 {
-	unsigned long time_to_timeout = 0;
 	unsigned int status_read;
-	ktime_t start, end;
 	int ret;
+	struct i2c_adapter_group *smbus =
+		&priv->smbus_port_adapter[target_port];
 
-	start = ktime_get_real();
+	if (!priv->settings.tp[target_port].poll_interval_ms) {
+		ret = wait_for_completion_timeout(&smbus->completion,
+						  smbus->i2c.timeout);
+		if (!ret) {
+			dev_err(&priv->i3cdev->dev,
+				"Status read timeout reached on target port %d\n",
+				target_port);
+			return -ETIMEDOUT;
+		}
 
-	while (time_to_timeout < (long)I3C_HUB_SMBUS_400kHz_TIMEOUT) {
-		ret = regmap_read(priv->regmap, target_port_status,
-				  &status_read);
+		*status = (u8)smbus->status &
+			  I3C_HUB_CONTROLLER_AGENT_STATUS_MASK;
+	} else {
+		ret = regmap_read_poll_timeout(
+			priv->regmap, target_port_status, status_read,
+			(u8)status_read & I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG,
+			I3C_HUB_SMBUS_STATUS_READ_INTERVAL_US_CEIL(
+				data_len, I3C_HUB_SMBUS_CLOCK_KHZ),
+			jiffies_to_usecs(smbus->i2c.timeout));
+
+		if (ret) {
+			dev_err(&priv->i3cdev->dev,
+				"Status read timeout reached on target port %d\n",
+				target_port);
+			return ret;
+		}
+
+		ret = regmap_write(priv->regmap, target_port_status,
+				   I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG);
 		if (ret)
 			return ret;
 
 		*status = (u8)status_read &
 			  I3C_HUB_CONTROLLER_AGENT_STATUS_MASK;
-
-		if (*status & I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG) {
-			if ((*status &
-			     I3C_HUB_CONTROLLER_AGENT_RET_CODE_MASK) &&
-			    !(*status &
-			      I3C_HUB_CONTROLLER_AGENT_ADDRESS_NACK)) {
-				dev_err(&priv->i3cdev->dev,
-					"Invalid transfer status returned: 0x%02x\n",
-					*status);
-				return -EAGAIN;
-			}
-			return 0;
-		}
-
-		end = ktime_get_real();
-		time_to_timeout = end - start;
 	}
-	dev_err(&priv->i3cdev->dev, "Status read timeout reached\n");
+
+	if ((*status & I3C_HUB_CONTROLLER_AGENT_RET_CODE_MASK) &&
+	    !(*status & I3C_HUB_CONTROLLER_AGENT_ADDRESS_NACK)) {
+		dev_err(&priv->i3cdev->dev,
+			"Invalid transfer status returned: 0x%02x\n", *status);
+		return -EAGAIN;
+	}
+
 	return 0;
 }
 
@@ -1557,11 +1583,6 @@ static int i3c_hub_smbus_msg(struct i3c_hub *priv, struct i2c_msg *xfers,
 	desc[2] = write_length;
 	desc[3] = read_length;
 
-	ret = regmap_write(priv->regmap, target_port_status,
-			   I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG);
-	if (ret)
-		return ret;
-
 	mutex_lock(&priv->page_mutex);
 	ret = regmap_write(priv->regmap, I3C_HUB_PAGE_PTR,
 			   controller_buffer_page);
@@ -1592,8 +1613,9 @@ static int i3c_hub_smbus_msg(struct i3c_hub *priv, struct i2c_msg *xfers,
 	if (ret)
 		return ret;
 
-	ret = i3c_hub_read_transaction_status(priv, target_port_status,
-					      &status);
+	ret = i3c_hub_read_transaction_status(priv, target_port,
+					      target_port_status, &status,
+					      write_length + read_length);
 	if (ret)
 		return ret;
 
@@ -2080,14 +2102,17 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 		if (!smbus->used)
 			continue;
 
+		if (!priv->settings.tp[i].poll_interval_ms)
+			continue;
+
 		schedule_delayed_work(
 			&smbus->delayed_work_polling,
-			msecs_to_jiffies(I3C_HUB_POLLING_ROLL_PERIOD_MS));
+			msecs_to_jiffies(
+				priv->settings.tp[i].poll_interval_ms));
 	}
 }
 
-static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
-					     struct i2c_adapter_group *g_adap,
+static int send_smbus_target_data_to_backend(struct i2c_adapter_group *smbus,
 					     u8 address, u8 *local_buffer,
 					     u8 len)
 {
@@ -2097,12 +2122,12 @@ static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
 	int i, ret;
 	u8 tmp;
 
-	mutex_lock(&g_adap->mutex);
+	mutex_lock(&smbus->mutex);
 
-	list_for_each_entry(backend, &g_adap->backend_entry, list) {
+	list_for_each_entry(backend, &smbus->backend_entry, list) {
 		client = backend->client;
 		if (client->addr == address >> 1) {
-			mutex_unlock(&g_adap->mutex);
+			mutex_unlock(&smbus->mutex);
 			ret = i2c_slave_event(client, I2C_SLAVE_WRITE_REQUESTED,
 					      &address);
 			if (ret)
@@ -2120,23 +2145,24 @@ static int send_smbus_target_data_to_backend(struct i3c_hub *priv,
 		}
 	}
 
-	mutex_unlock(&g_adap->mutex);
+	mutex_unlock(&smbus->mutex);
 #endif /* CONFIG_I2C_SLAVE */
 	return -ENXIO;
 }
 
-static int read_smbus_target_buffer_page(struct i3c_hub *priv,
+static int read_smbus_target_buffer_page(struct i2c_adapter_group *smbus,
 					 u8 target_buffer_page, u8 *address,
 					 u8 *local_buffer, u8 *len)
 {
-	struct device *dev = i3cdev_to_dev(priv->i3cdev);
+	struct i3c_hub *hub = smbus->priv;
+	struct device *dev = i3cdev_to_dev(hub->i3cdev);
 	u32 status;
 	int ret;
 
-	mutex_lock(&priv->page_mutex);
-	regmap_write(priv->regmap, I3C_HUB_PAGE_PTR, target_buffer_page);
+	mutex_lock(&hub->page_mutex);
+	regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, target_buffer_page);
 
-	ret = regmap_read(priv->regmap, I3C_HUB_TARGET_BUFF_LENGTH, &status);
+	ret = regmap_read(hub->regmap, I3C_HUB_TARGET_BUFF_LENGTH, &status);
 	if (ret)
 		goto error;
 
@@ -2145,111 +2171,240 @@ static int read_smbus_target_buffer_page(struct i3c_hub *priv,
 		goto error;
 
 	if (*len > I3C_HUB_SMBUS_TARGET_PAYLOAD_SIZE) {
-		dev_err(dev, "Received message too big for hub buffer\n");
+		dev_warn_ratelimited(
+			dev, "Received message too big for hub buffer\n");
 		ret = -EMSGSIZE;
+		*len = 0;
 		goto error;
 	}
 
-	ret = regmap_read(priv->regmap, I3C_HUB_TARGET_BUFF_ADDRESS, &status);
+	ret = regmap_read(hub->regmap, I3C_HUB_TARGET_BUFF_ADDRESS, &status);
 	if (ret)
 		goto error;
 
 	*address = status;
 
-	ret = regmap_bulk_read(priv->regmap, I3C_HUB_TARGET_BUFF_DATA,
+	ret = regmap_bulk_read(hub->regmap, I3C_HUB_TARGET_BUFF_DATA,
 			       local_buffer, *len);
 
 error:
-	regmap_write(priv->regmap, I3C_HUB_PAGE_PTR, 0x00);
-	mutex_unlock(&priv->page_mutex);
+	regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&hub->page_mutex);
+	return ret;
+}
+
+static int process_smbus_controller_status(struct i2c_adapter_group *smbus,
+					   u8 reg, u32 status)
+{
+	struct i3c_hub *hub = smbus->priv;
+	int ret = 0;
+
+	if (status & I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG) {
+		smbus->status = status;
+		ret = regmap_write(hub->regmap, reg,
+				   I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG);
+		complete(&smbus->completion);
+	}
+
+	return ret;
+}
+
+/**
+ * Controller buffer page is determined by adding the first buffer page number to port
+ * index multiplied by four. The two target buffer page numbers are determined the same
+ * way but they are offset by 2 and 3 from the controller page.
+ */
+static int process_smbus_target_status(struct i2c_adapter_group *smbus, u8 reg,
+				       u32 status)
+{
+	struct i3c_hub *hub = smbus->priv;
+	struct device *dev = i3cdev_to_dev(hub->i3cdev);
+	u8 controller_buffer_page =
+		I3C_HUB_CONTROLLER_BUFFER_PAGE + 4 * smbus->tp_port;
+	u8 local_buffer[I3C_HUB_SMBUS_TARGET_PAYLOAD_SIZE] = { 0 };
+	u8 target_buffer_page, address = 0, len = 0, flag;
+	int ret;
+
+	if (smbus->last_processed_buf)
+		status &= ~smbus->last_processed_buf;
+
+	if (status & I3C_HUB_TARGET_BUF_0_RECEIVE) {
+		target_buffer_page = controller_buffer_page + 2;
+		flag = I3C_HUB_TARGET_BUF_0_RECEIVE;
+	} else if (status & I3C_HUB_TARGET_BUF_1_RECEIVE) {
+		target_buffer_page = controller_buffer_page + 3;
+		flag = I3C_HUB_TARGET_BUF_1_RECEIVE;
+	} else {
+		return -EINVAL;
+	}
+
+	ret = read_smbus_target_buffer_page(smbus, target_buffer_page, &address,
+					    local_buffer, &len);
+	if (ret && ret != -EMSGSIZE) {
+		dev_dbg(dev, "Failed to read target buffer page: %d\n", ret);
+		return ret;
+	}
+
+	smbus->last_processed_buf = flag;
+
+	if (status & I3C_HUB_TARGET_BUF_OVRFL)
+		flag |= I3C_HUB_TARGET_BUF_OVRFL;
+
+	ret = regmap_write(hub->regmap, reg, flag);
+	if (ret) {
+		dev_dbg(dev, "Failed to clear target port status\n");
+		return ret;
+	}
+
+	if (len) {
+		ret = send_smbus_target_data_to_backend(smbus, address,
+							local_buffer, len);
+		if (ret) {
+			dev_dbg(dev, "Failed to send data to backend: %d\n",
+				ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int i3c_hub_process_smbus_status(struct i2c_adapter_group *smbus)
+{
+	struct i3c_hub *hub = smbus->priv;
+	u8 target_port_status = I3C_HUB_TP0_SMBUS_AGNT_STS + smbus->tp_port;
+	struct device *dev = i3cdev_to_dev(hub->i3cdev);
+	u32 status;
+	int ret = 0;
+	u32 poll_interval_ms =
+		hub->settings.tp[smbus->tp_port].poll_interval_ms;
+
+	ret = regmap_read(hub->regmap, target_port_status, &status);
+	if (ret)
+		return ret;
+
+	/* smbus controller agent status */
+	if (!poll_interval_ms) {
+		ret = process_smbus_controller_status(smbus, target_port_status,
+						      status);
+		if (ret)
+			dev_warn_ratelimited(
+				dev,
+				"Failed to process smbus controller status\n");
+	}
+
+	/* smbus target agent status */
+	status &= I3C_HUB_TARGET_BUF_STATUS_MASK;
+
+	while (status) {
+		ret = process_smbus_target_status(smbus, target_port_status,
+						  status);
+		if (ret) {
+			dev_warn_ratelimited(
+				dev,
+				"Failed to process smbus target status: %d\n",
+				ret);
+			break;
+		}
+
+		if (!poll_interval_ms)
+			break;
+
+		ret = regmap_read(hub->regmap, target_port_status, &status);
+		if (ret)
+			break;
+		status &= I3C_HUB_TARGET_BUF_STATUS_MASK;
+	}
+
 	return ret;
 }
 
 /**
  * i3c_hub_delayed_work_polling() - This delayed work is a polling mechanism to
- * find if any transaction happened. Controller buffer page is determined by adding
- * the first buffer page number to port index multiplied by four.
- * The two target buffer page numbers are determined the same way but they are offset
- * by 2 and 3 from the controller page.
+ * find if any transaction happened.
  */
 static void i3c_hub_delayed_work_polling(struct work_struct *work)
 {
-	struct i2c_adapter_group *g_adap =
-		container_of(work, typeof(*g_adap), delayed_work_polling.work);
-	struct i3c_hub *priv = g_adap->priv;
-	u8 controller_buffer_page =
-		I3C_HUB_CONTROLLER_BUFFER_PAGE + 4 * g_adap->tp_port;
-	u8 target_port_status = I3C_HUB_TP0_SMBUS_AGNT_STS + g_adap->tp_port;
-	u8 local_buffer[I3C_HUB_SMBUS_TARGET_PAYLOAD_SIZE] = { 0 };
-	u8 target_buffer_page, address = 0, len = 0, flag;
-	struct device *dev = i3cdev_to_dev(priv->i3cdev);
-	u32 status;
+	struct i2c_adapter_group *smbus =
+		container_of(work, typeof(*smbus), delayed_work_polling.work);
+	struct device *dev = i3cdev_to_dev(smbus->priv->i3cdev);
 	int ret;
 
-	if (list_empty(&g_adap->backend_entry))
-		return;
-
-	ret = regmap_read(priv->regmap, target_port_status, &status);
-	if (ret) {
-		dev_err(dev, "Failed to read target port status\n");
-		return;
-	}
-	status &= I3C_HUB_TARGET_BUF_STATUS_MASK;
-
-	while (status) {
-		if (g_adap->last_processed_buf)
-			status &= ~g_adap->last_processed_buf;
-
-		if (status & I3C_HUB_TARGET_BUF_0_RECEIVE) {
-			target_buffer_page = controller_buffer_page + 2;
-			flag = I3C_HUB_TARGET_BUF_0_RECEIVE;
-		} else if (status & I3C_HUB_TARGET_BUF_1_RECEIVE) {
-			target_buffer_page = controller_buffer_page + 3;
-			flag = I3C_HUB_TARGET_BUF_1_RECEIVE;
-		} else {
-			break;
-		}
-
-		ret = read_smbus_target_buffer_page(
-			priv, target_buffer_page, &address, local_buffer, &len);
-		if (ret && ret != -EMSGSIZE) {
-			dev_err(dev, "Failed to read target buffer page: %d\n",
-				ret);
-			break;
-		}
-
-		g_adap->last_processed_buf = flag;
-
-		if (status & I3C_HUB_TARGET_BUF_OVRFL)
-			flag |= I3C_HUB_TARGET_BUF_OVRFL;
-
-		ret = regmap_write(priv->regmap, target_port_status, flag);
-		if (ret) {
-			dev_err(dev, "Failed to clear target port status\n");
-			break;
-		}
-
-		if (len) {
-			ret = send_smbus_target_data_to_backend(
-				priv, g_adap, address, local_buffer, len);
-			if (ret) {
-				dev_err(dev,
-					"Failed to send data to backend: %d\n",
-					ret);
-				break;
-			}
-		}
-
-		ret = regmap_read(priv->regmap, target_port_status, &status);
-		if (ret) {
-			dev_err(dev, "Failed to read target port status\n");
-			break;
-		}
-		status &= I3C_HUB_TARGET_BUF_STATUS_MASK;
+	if (!list_empty(&smbus->backend_entry)) {
+		ret = i3c_hub_process_smbus_status(smbus);
+		if (ret)
+			dev_warn_ratelimited(
+				dev,
+				"Failed to process TP %u smbus status: %d\n",
+				smbus->tp_port, ret);
 	}
 
-	schedule_delayed_work(&g_adap->delayed_work_polling,
-			      msecs_to_jiffies(I3C_HUB_POLLING_ROLL_PERIOD_MS));
+	schedule_delayed_work(
+		&smbus->delayed_work_polling,
+		msecs_to_jiffies(smbus->priv->settings.tp[smbus->tp_port]
+					 .poll_interval_ms));
+}
+
+static int i3c_hub_smbus_ibi_handler(struct i3c_hub *hub,
+				     const struct i3c_ibi_payload *payload)
+{
+	struct i2c_adapter_group *smbus;
+	u8 tp, tps;
+	int val, ret, rc;
+	struct device *dev = i3cdev_to_dev(hub->i3cdev);
+
+	if (payload->len < 2) {
+		ret = regmap_read(hub->regmap, I3C_HUB_TP_SMBUS_AGNT_IBI_STS,
+				  &val);
+		if (ret)
+			return ret;
+
+		tps = (u8)val;
+	} else {
+		tps = ((const u8 *)payload->data)[1];
+	}
+
+	if (!tps)
+		return 0;
+
+	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
+			   REGISTERS_UNLOCK_CODE);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(hub->regmap, I3C_HUB_TP_IBI_CONF, 0);
+	if (ret)
+		goto exit;
+
+	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
+			   REGISTERS_LOCK_CODE);
+	if (ret)
+		goto exit;
+
+	while (tps) {
+		tp = (u8)__ffs((unsigned long)tps);
+		tps &= (tps - 1);
+
+		if (hub->settings.tp[tp].poll_interval_ms)
+			continue;
+
+		smbus = &hub->smbus_port_adapter[tp];
+		rc = i3c_hub_process_smbus_status(smbus);
+		if (rc) {
+			dev_warn_ratelimited(
+				dev,
+				"Failed to process TP %u smbus status: %d\n",
+				tp, rc);
+		}
+	}
+
+exit:
+	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
+		     REGISTERS_UNLOCK_CODE);
+
+	regmap_write(hub->regmap, I3C_HUB_TP_IBI_CONF, hub->smbus_ibi_en_mask);
+	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE, REGISTERS_LOCK_CODE);
+	return ret;
 }
 
 static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
@@ -2265,14 +2420,31 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 	smbus->tp_port = i;
 	smbus->tp_mask = BIT(i);
 
+	init_completion(&smbus->completion);
 	i2c->owner = THIS_MODULE;
 	i2c->algo = &i3c_controller_smbus_algo;
 	i2c->dev.parent = dev;
 	i2c->dev.of_node = smbus->of_node;
-	i2c->timeout = 1000;
+	i2c->timeout = HZ;
 	i2c->retries = 3;
 	snprintf(i2c->name, sizeof(i2c->name), "hub%s.port%d", dev_name(dev),
 		 smbus->tp_port);
+
+	if (priv->settings.tp[i].poll_interval_ms) {
+		ret = regmap_clear_bits(priv->regmap, I3C_HUB_TP_IBI_CONF,
+					smbus->tp_mask);
+		if (ret)
+			return ret;
+		INIT_DELAYED_WORK(&smbus->delayed_work_polling,
+				  i3c_hub_delayed_work_polling);
+		priv->smbus_ibi_en_mask &= ~smbus->tp_mask;
+	} else {
+		ret = regmap_set_bits(priv->regmap, I3C_HUB_TP_IBI_CONF,
+				      smbus->tp_mask);
+		if (ret)
+			return ret;
+		priv->smbus_ibi_en_mask |= smbus->tp_mask;
+	}
 
 	i2c_set_adapdata(i2c, smbus);
 
@@ -2281,11 +2453,7 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 		return ret;
 
 	smbus->used = 1;
-
-	INIT_DELAYED_WORK(&smbus->delayed_work_polling,
-			  i3c_hub_delayed_work_polling);
-
-	return 0;
+	return ret;
 }
 
 static int i3c_hub_gpio_direction_input(struct gpio_chip *gc, unsigned off)
@@ -2590,6 +2758,17 @@ static void i3c_hub_ibi_handler(struct i3c_device *dev,
 
 	if (status & TP_IO_FLAG_STATUS)
 		i3c_hub_io_ibi_handler(priv, payload);
+
+	if (status & SMBUS_AGENT_EVENT_FLAG_STATUS) {
+		ret = i3c_hub_smbus_ibi_handler(priv, payload);
+		if (ret) {
+			dev_warn_ratelimited(&dev->dev,
+					     "Failed to handle SMBus IBI: %d\n",
+					     ret);
+			return;
+		}
+	}
+
 }
 
 static inline void i3c_hub_regmap_lock(void *__user)
@@ -2684,8 +2863,14 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 	/* Register logic for native smbus ports */
 	for (i = 0; i < priv->dev_info->n_ports; i++) {
 		priv->smbus_port_adapter[i].used = 0;
-		if (priv->settings.tp[i].mode == I3C_HUB_DT_TP_MODE_SMBUS)
+		if (priv->settings.tp[i].mode == I3C_HUB_DT_TP_MODE_SMBUS) {
 			ret = i3c_hub_smbus_tp_algo(priv, i);
+			if (ret)
+				dev_warn(
+					dev,
+					"Failed to setup SMBus adapter, port: %d\n",
+					i);
+		}
 	}
 
 	ret = i3c_hub_configure_hw(dev);
