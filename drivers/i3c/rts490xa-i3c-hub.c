@@ -285,7 +285,10 @@
 #define I3C_HUB_DT_IO_STRENGTH_NOT_DEFINED 0xFF
 
 /* SMBus transaction types fields */
-#define I3C_HUB_SMBUS_400kHz BIT(2)
+#define I3C_HUB_SMBUS_100kHz  0x00
+#define I3C_HUB_SMBUS_200kHz  BIT(1)
+#define I3C_HUB_SMBUS_400kHz  BIT(2)
+#define I3C_HUB_SMBUS_1000kHz (BIT(1) | BIT(2))
 
 /* Hub buffer size */
 #define I3C_HUB_CONTROLLER_BUFFER_SIZE 88
@@ -295,7 +298,6 @@
 	(I3C_HUB_CONTROLLER_BUFFER_SIZE - I3C_HUB_SMBUS_DESCRIPTOR_SIZE)
 #define I3C_HUB_SMBUS_TARGET_PAYLOAD_SIZE (I3C_HUB_TARGET_BUFFER_SIZE - 2)
 
-#define I3C_HUB_SMBUS_CLOCK_KHZ 400
 /* Hub SMBus status register read interval (microseconds, ceil) */
 #define I3C_HUB_SMBUS_STATUS_READ_INTERVAL_US_CEIL(len, clk_khz) \
 	DIV_ROUND_UP(1000U * 9U * (u32)(len), (u32)(clk_khz))
@@ -361,6 +363,7 @@ struct tp_setting {
 	u8 io_mode;
 	bool always_enable;
 	u32 poll_interval_ms;
+	u32 clock_frequency;
 };
 
 struct dt_settings {
@@ -577,6 +580,33 @@ static void i3c_hub_of_get_setting(struct device *dev,
 	dev_warn(dev, "Unknown setting for %s: '%s'\n", setting_name, sval);
 }
 
+static bool i3c_hub_smbus_validate_clock_frequency(u32 hz)
+{
+	switch (hz) {
+	case 100000:
+	case 200000:
+	case 400000:
+	case 1000000:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline u8 i3c_hub_smbus_rate_bits_from_hz(u32 hz)
+{
+	switch (hz) {
+	case 100000:
+		return I3C_HUB_SMBUS_100kHz;
+	case 200000:
+		return I3C_HUB_SMBUS_200kHz;
+	case 1000000:
+		return I3C_HUB_SMBUS_1000kHz;
+	default:
+		return I3C_HUB_SMBUS_400kHz;
+	}
+}
+
 static void i3c_hub_tp_of_get_setting(struct device *dev,
 				      const struct device_node *node,
 				      struct tp_setting tp_setting[])
@@ -620,6 +650,17 @@ static void i3c_hub_tp_of_get_setting(struct device *dev,
 			of_property_read_bool(tp_node, "always-enable");
 		if (!of_property_read_u32(tp_node, "polling-interval-ms", &val))
 			tp_setting[id].poll_interval_ms = val;
+
+		if (!of_property_read_u32(tp_node, "clock-frequency", &val)) {
+			if (i3c_hub_smbus_validate_clock_frequency(val))
+				tp_setting[id].clock_frequency = val;
+			else
+				dev_warn(
+					dev,
+					"Unsupported TP%d smbus clock-frequency: %u Hz, using default %u Hz\n",
+					id, val,
+					tp_setting[id].clock_frequency);
+		}
 	}
 }
 
@@ -760,6 +801,7 @@ static void i3c_hub_of_default_configuration(struct device *dev)
 		priv->settings.tp[id].io_mode =
 			I3C_HUB_DT_TP_IO_MODE_NOT_DEFINED;
 		priv->settings.tp[id].poll_interval_ms = 0;
+		priv->settings.tp[id].clock_frequency = 400000;
 	}
 }
 
@@ -1375,6 +1417,9 @@ static int i3c_hub_debugfs_init(struct i3c_hub *priv, const char *hub_id)
 		sprintf(file_name, "tp%i.poll_interval_ms", i);
 		debugfs_create_u32(file_name, 0400, dt_conf_dir,
 				   &settings->tp[i].poll_interval_ms);
+		sprintf(file_name, "tp%i.clock_frequency", i);
+		debugfs_create_u32(file_name, 0400, dt_conf_dir,
+				   &settings->tp[i].clock_frequency);
 	}
 
 	entry = debugfs_create_dir("reg", priv->debug_dir);
@@ -1495,6 +1540,7 @@ static int i3c_hub_read_transaction_status(struct i3c_hub *priv, u8 target_port,
 	int ret;
 	struct i2c_adapter_group *smbus =
 		&priv->smbus_port_adapter[target_port];
+	u32 smbus_clk = priv->settings.tp[target_port].clock_frequency / 1000;
 
 	if (!priv->settings.tp[target_port].poll_interval_ms) {
 		ret = wait_for_completion_timeout(&smbus->completion,
@@ -1512,8 +1558,8 @@ static int i3c_hub_read_transaction_status(struct i3c_hub *priv, u8 target_port,
 		ret = regmap_read_poll_timeout(
 			priv->regmap, target_port_status, status_read,
 			(u8)status_read & I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG,
-			I3C_HUB_SMBUS_STATUS_READ_INTERVAL_US_CEIL(
-				data_len, I3C_HUB_SMBUS_CLOCK_KHZ),
+			I3C_HUB_SMBUS_STATUS_READ_INTERVAL_US_CEIL(data_len,
+								   smbus_clk),
 			jiffies_to_usecs(smbus->i2c.timeout));
 
 		if (ret) {
@@ -1572,6 +1618,9 @@ static int i3c_hub_smbus_msg(struct i3c_hub *priv, struct i2c_msg *xfers,
 	u8 desc[I3C_HUB_SMBUS_DESCRIPTOR_SIZE] = { 0 };
 	u8 status;
 	int ret = 0;
+
+	transaction_type = i3c_hub_smbus_rate_bits_from_hz(
+		priv->settings.tp[target_port].clock_frequency);
 
 	if (rw)
 		rw_address |= BIT(0);
