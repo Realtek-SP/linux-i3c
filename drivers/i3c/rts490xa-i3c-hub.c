@@ -290,6 +290,11 @@
 #define I3C_HUB_SMBUS_400kHz  BIT(2)
 #define I3C_HUB_SMBUS_1000kHz (BIT(1) | BIT(2))
 
+/* SMBus xfer type for i3c_hub_smbus_msg xfer_type parameter */
+#define I3C_HUB_SMBUS_XFER_WRITE 0
+#define I3C_HUB_SMBUS_XFER_READ	 1
+#define I3C_HUB_SMBUS_XFER_WR_RD 2
+
 /* Hub buffer size */
 #define I3C_HUB_CONTROLLER_BUFFER_SIZE 88
 #define I3C_HUB_TARGET_BUFFER_SIZE     80
@@ -1589,80 +1594,98 @@ static int i3c_hub_read_transaction_status(struct i3c_hub *priv, u8 target_port,
 }
 
 /*
- * i3c_hub_smbus_msg() - This starts a smbus write transaction by writing a descriptor
+ * i3c_hub_smbus_msg() - This starts a smbus transaction by writing a descriptor
  * and a message to the hub registers. Controller buffer page is determined by multiplying the
  * target port index by four and adding the base page number to it.
- * @priv: a pointer to the i3c hub main structure
- * @ssport: a number of the port where the transaction will happen
+ * @hub: a pointer to the i3c hub main structure
+ * @target_port: a number of the port where the transaction will happen
  * @xfers: i2c_msg struct received from the master_xfers callback
  * @nxfers_i: the number of the current message
- * @rw: number informing if the message is of read or write type (0 for write, 1 for read)
+ * @xfer_type: transfer type:
+ *   - I3C_HUB_SMBUS_XFER_WRITE (0): single write
+ *   - I3C_HUB_SMBUS_XFER_READ  (1): single read
+ *   - I3C_HUB_SMBUS_XFER_WR_RD (2): write followed by read
+ *     (uses xfers[nxfers_i] as write and xfers[nxfers_i+1] as read)
  * @return_status: number passed by reference where the return status code is saved
  *
  * Return: on success function returns zero. Otherwise the regmap read or write error code
  * is returned
+ * Note: for WR_RD the caller must ensure xfers[nxfers_i+1] exists, the address
+ * matches, and write_len + read_len <= I3C_HUB_SMBUS_PAYLOAD_SIZE.
  */
-static int i3c_hub_smbus_msg(struct i3c_hub *priv, struct i2c_msg *xfers,
-			     u8 target_port, u8 nxfers_i, u8 rw,
+static int i3c_hub_smbus_msg(struct i3c_hub *hub, struct i2c_msg *xfers,
+			     u8 target_port, u8 nxfers_i, u8 xfer_type,
 			     u8 *return_status)
 {
 	u8 transaction_type = I3C_HUB_SMBUS_400kHz;
 	u8 controller_buffer_page =
 		I3C_HUB_CONTROLLER_BUFFER_PAGE + 4 * target_port;
-	int write_length = xfers[nxfers_i].len;
-	int read_length = xfers[nxfers_i].len;
+	int write_length = 0, read_length = 0;
 	u8 target_port_status = I3C_HUB_TP0_SMBUS_AGNT_STS + target_port;
-	u8 addr = xfers[nxfers_i].addr;
 	u8 target_port_code = BIT(target_port);
-	u8 rw_address = 2 * addr;
+	u8 rw_address = xfers[nxfers_i].addr << 1;
 	u8 desc[I3C_HUB_SMBUS_DESCRIPTOR_SIZE] = { 0 };
 	u8 status;
 	int ret = 0;
 
 	transaction_type = i3c_hub_smbus_rate_bits_from_hz(
-		priv->settings.tp[target_port].clock_frequency);
+		hub->settings.tp[target_port].clock_frequency);
 
-	if (rw)
+	switch (xfer_type) {
+	case I3C_HUB_SMBUS_XFER_WRITE:
+		write_length = xfers[nxfers_i].len;
+		break;
+	case I3C_HUB_SMBUS_XFER_READ:
+		read_length = xfers[nxfers_i].len;
 		rw_address |= BIT(0);
-	else
-		read_length = 0;
+		break;
+	case I3C_HUB_SMBUS_XFER_WR_RD:
+		write_length = xfers[nxfers_i].len;
+		read_length = xfers[nxfers_i + 1].len;
+		transaction_type |= BIT(0);
+		break;
+	default:
+		return -EINVAL;
+	}
 
+	/* Assemble descriptor */
 	desc[0] = rw_address;
 	desc[1] = transaction_type;
 	desc[2] = write_length;
 	desc[3] = read_length;
 
-	mutex_lock(&priv->page_mutex);
-	ret = regmap_write(priv->regmap, I3C_HUB_PAGE_PTR,
+	mutex_lock(&hub->page_mutex);
+	ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR,
 			   controller_buffer_page);
 	if (ret)
 		goto unlock;
 
-	ret = regmap_bulk_write(priv->regmap, I3C_HUB_CONTROLLER_AGENT_BUFF,
+	ret = regmap_bulk_write(hub->regmap, I3C_HUB_CONTROLLER_AGENT_BUFF,
 				desc, I3C_HUB_SMBUS_DESCRIPTOR_SIZE);
 	if (ret)
 		goto unlock;
 
-	if (!rw && write_length) {
-		ret = regmap_bulk_write(priv->regmap,
+	if (write_length) {
+		ret = regmap_bulk_write(hub->regmap,
 					I3C_HUB_CONTROLLER_AGENT_BUFF_DATA,
-					xfers[nxfers_i].buf,
-					xfers[nxfers_i].len);
+					xfers[nxfers_i].buf, write_length);
 		if (ret)
 			goto unlock;
 	}
 
-	ret = regmap_write(priv->regmap, I3C_HUB_PAGE_PTR, 0x00);
-	mutex_unlock(&priv->page_mutex);
+	ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&hub->page_mutex);
 	if (ret)
 		return ret;
 
-	ret = regmap_write(priv->regmap, I3C_HUB_TP_SMBUS_AGNT_TRANS_START,
+	/* Start transaction */
+	ret = regmap_write(hub->regmap, I3C_HUB_TP_SMBUS_AGNT_TRANS_START,
 			   target_port_code);
 	if (ret)
 		return ret;
 
-	ret = i3c_hub_read_transaction_status(priv, target_port,
+	/* Get transaction status */
+	ret = i3c_hub_read_transaction_status(hub, target_port,
 					      target_port_status, &status,
 					      write_length + read_length);
 	if (ret)
@@ -1670,29 +1693,46 @@ static int i3c_hub_smbus_msg(struct i3c_hub *priv, struct i2c_msg *xfers,
 
 	*return_status = status;
 
-	if (rw) {
-		mutex_lock(&priv->page_mutex);
-		ret = regmap_write(priv->regmap, I3C_HUB_PAGE_PTR,
+	/* if read_length is non-zero, read back the data */
+	if (read_length) {
+		mutex_lock(&hub->page_mutex);
+		ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR,
 				   controller_buffer_page);
 		if (ret)
 			goto unlock;
 
-		ret = regmap_bulk_read(priv->regmap,
-				       I3C_HUB_CONTROLLER_AGENT_BUFF_DATA,
-				       xfers[nxfers_i].buf,
-				       xfers[nxfers_i].len);
+		if (xfer_type == I3C_HUB_SMBUS_XFER_READ) {
+			ret = regmap_bulk_read(
+				hub->regmap, I3C_HUB_CONTROLLER_AGENT_BUFF_DATA,
+				xfers[nxfers_i].buf, read_length);
+		} else {
+			ret = regmap_bulk_read(
+				hub->regmap,
+				I3C_HUB_CONTROLLER_AGENT_BUFF_DATA +
+					write_length,
+				xfers[nxfers_i + 1].buf, read_length);
+		}
 		if (ret)
 			goto unlock;
 
-		ret = regmap_write(priv->regmap, I3C_HUB_PAGE_PTR, 0x00);
-		mutex_unlock(&priv->page_mutex);
+		ret = regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+		mutex_unlock(&hub->page_mutex);
 	}
 
 	return ret;
 unlock:
-	regmap_write(priv->regmap, I3C_HUB_PAGE_PTR, 0x00);
-	mutex_unlock(&priv->page_mutex);
+	regmap_write(hub->regmap, I3C_HUB_PAGE_PTR, 0x00);
+	mutex_unlock(&hub->page_mutex);
 	return ret;
+}
+
+static inline bool i3c_hub_can_combine_wr_rd(const struct i2c_msg *w,
+					     const struct i2c_msg *r)
+{
+	/* w: write, r: read; same addr; total length within payload */
+	return !(w->flags & I2C_M_RD) && (r->flags & I2C_M_RD) &&
+	       w->addr == r->addr &&
+	       (w->len + r->len) <= I3C_HUB_SMBUS_PAYLOAD_SIZE;
 }
 
 /**
@@ -1709,29 +1749,49 @@ static int i3c_controller_smbus_port_adapter_xfer(struct i2c_adapter *adap,
 						  int nxfers)
 {
 	struct i2c_adapter_group *smbus = i2c_get_adapdata(adap);
-	struct i3c_hub *priv = smbus->priv;
-	int ret_sum = 0;
-	int ret;
-	u8 return_status;
-	u8 nxfers_i;
-	u8 rw;
+	struct i3c_hub *hub = smbus->priv;
+	int ret_sum = 0, ret, len, type, nxfers_i;
+	u8 return_status = 0;
+	const struct i2c_msg *cur = NULL, *next = NULL;
 
 	for (nxfers_i = 0; nxfers_i < nxfers; nxfers_i++) {
-		if (xfers[nxfers_i].len > I3C_HUB_SMBUS_PAYLOAD_SIZE) {
+		cur = &xfers[nxfers_i];
+		len = cur->len;
+		type = cur->flags & I2C_M_RD ? I3C_HUB_SMBUS_XFER_READ :
+					       I3C_HUB_SMBUS_XFER_WRITE;
+
+		/* Per-message length limit check */
+		if (len > I3C_HUB_SMBUS_PAYLOAD_SIZE) {
 			dev_err(&adap->dev,
 				"Message nr. %d not sent - length over %d bytes.\n",
 				nxfers_i, I3C_HUB_SMBUS_PAYLOAD_SIZE);
 			continue;
 		}
 
-		rw = xfers[nxfers_i].flags % 2;
+		/* Try to combine write followed by read to the same address */
+		if (type == I3C_HUB_SMBUS_XFER_WRITE &&
+		    (nxfers_i + 1) < nxfers) {
+			next = &xfers[nxfers_i + 1];
+			if (i3c_hub_can_combine_wr_rd(cur, next))
+				type = I3C_HUB_SMBUS_XFER_WR_RD;
+		}
 
-		ret = i3c_hub_smbus_msg(priv, xfers, smbus->tp_port, nxfers_i,
-					rw, &return_status);
+		ret = i3c_hub_smbus_msg(hub, xfers, smbus->tp_port, nxfers_i,
+					type, &return_status);
 		if (ret)
 			return ret;
-		if (return_status == I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG)
-			ret_sum++;
+
+		if (type == I3C_HUB_SMBUS_XFER_WR_RD) {
+			if (return_status ==
+			    I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG)
+				ret_sum += 2;
+			nxfers_i++; /* skip the next read message */
+
+		} else {
+			if (return_status ==
+			    I3C_HUB_CONTROLLER_AGENT_FINISH_FLAG)
+				ret_sum++;
+		}
 	}
 	return ret_sum;
 }
