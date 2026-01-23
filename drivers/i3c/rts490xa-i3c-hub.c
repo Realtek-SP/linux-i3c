@@ -199,7 +199,9 @@
 #define I3C_HUB_TP5_SMBUS_AGNT_STS	      0x69
 #define I3C_HUB_TP6_SMBUS_AGNT_STS	      0x6A
 #define I3C_HUB_TP7_SMBUS_AGNT_STS	      0x6B
+
 #define I3C_HUB_ONCHIP_TD_AND_SMBUS_AGNT_CONF 0x6C
+#define TARGET_AGENT_BUF_FULL_SDA_LOW_EN      BIT(5)
 
 /* Transaction status checking mask */
 #define I3C_HUB_CONTROLLER_AGENT_STATUS_MASK   (0xF0 | BIT(0))
@@ -2534,6 +2536,16 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 			return ret;
 		priv->smbus_ibi_en_mask |= smbus->tp_mask;
 	}
+
+	/* Enable SDA hold-low when both SMBus Target Agent buffers are full.
+	 * Used as a flow-control mechanism for MCTP to avoid upstream TX timeout
+	 * when target buffers are not serviced in time.
+	 */
+	ret = regmap_set_bits(priv->regmap,
+			      I3C_HUB_ONCHIP_TD_AND_SMBUS_AGNT_CONF,
+			      TARGET_AGENT_BUF_FULL_SDA_LOW_EN);
+	if (ret)
+		return ret;
 
 	i2c_set_adapdata(i2c, smbus);
 
