@@ -1738,7 +1738,7 @@ static inline bool i3c_hub_can_combine_wr_rd(const struct i2c_msg *w,
 }
 
 /**
- * i3c_controller_smbus_port_adapter_xfer() - i3c hub smbus transfer logic
+ * i3c_hub_smbus_port_adapter_xfer() - i3c hub smbus transfer logic
  * @adap: i2c_adapter corresponding with single port in the i3c hub
  * @xfers: all messages descriptors and data
  * @nxfers: amount of single messages in a transfer
@@ -1746,9 +1746,8 @@ static inline bool i3c_hub_can_combine_wr_rd(const struct i2c_msg *w,
  * Return: function returns the sum of correctly sent messages (only those with hub return
  * status 0x01)
  */
-static int i3c_controller_smbus_port_adapter_xfer(struct i2c_adapter *adap,
-						  struct i2c_msg *xfers,
-						  int nxfers)
+static int i3c_hub_smbus_port_adapter_xfer(struct i2c_adapter *adap,
+					   struct i2c_msg *xfers, int nxfers)
 {
 	struct i2c_adapter_group *smbus = i2c_get_adapdata(adap);
 	struct i3c_hub *hub = smbus->priv;
@@ -2061,7 +2060,7 @@ static int i3c_hub_logic_register(struct i3c_master_controller *controller,
 	return i3c_master_register(controller, parent, &i3c_hub_i3c_ops, false);
 }
 
-static u32 i3c_controller_smbus_funcs(struct i2c_adapter *adapter)
+static u32 i3c_hub_smbus_funcs(struct i2c_adapter *adapter)
 {
 	return (I2C_FUNC_SMBUS_EMUL | I2C_FUNC_I2C) & ~I2C_FUNC_SMBUS_QUICK;
 }
@@ -2124,9 +2123,9 @@ static int unreg_i2c_target(struct i2c_client *client)
 }
 #endif /* CONFIG_I2C_SLAVE */
 
-static const struct i2c_algorithm i3c_controller_smbus_algo = {
-	.master_xfer = i3c_controller_smbus_port_adapter_xfer,
-	.functionality = i3c_controller_smbus_funcs,
+static const struct i2c_algorithm i3c_hub_smbus_algo = {
+	.master_xfer = i3c_hub_smbus_port_adapter_xfer,
+	.functionality = i3c_hub_smbus_funcs,
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
 	.reg_slave = reg_i2c_target,
 	.unreg_slave = unreg_i2c_target,
@@ -2513,7 +2512,7 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 
 	init_completion(&smbus->completion);
 	i2c->owner = THIS_MODULE;
-	i2c->algo = &i3c_controller_smbus_algo;
+	i2c->algo = &i3c_hub_smbus_algo;
 	i2c->dev.parent = dev;
 	i2c->dev.of_node = smbus->of_node;
 	i2c->timeout = HZ;
