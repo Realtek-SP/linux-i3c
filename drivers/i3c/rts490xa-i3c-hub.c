@@ -2819,12 +2819,13 @@ static void i3c_hub_io_ibi_handler(struct i3c_hub *hub,
 				continue;
 			}
 
+			regmap_write(hub->regmap,
+				     I3C_HUB_TP_SCL_IN_DETECT_FLG + i,
+				     BIT(level));
+
 			handle_nested_irq(irq);
 		}
 	}
-
-	regmap_bulk_write(hub->regmap, I3C_HUB_TP_SCL_IN_DETECT_FLG, pending,
-			  GPIO_BANK_SZ);
 }
 
 static void i3c_hub_ibi_handler(struct i3c_device *dev,
