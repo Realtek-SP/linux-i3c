@@ -1063,8 +1063,7 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 	if (ret)
 		return ret;
 
-	return regmap_update_bits(priv->regmap, I3C_HUB_TP_NET_CON_CONF,
-				  i3c_mask, i3c_val);
+	return regmap_write(priv->regmap, I3C_HUB_TP_NET_CON_CONF, i3c_val);
 }
 
 static int i3c_hub_hw_configure_misc(struct device *dev)
