@@ -2535,6 +2535,51 @@ static int i3c_hub_smbus_ibi_handler(struct i3c_hub *hub,
 	return 0;
 }
 
+/*
+ * Sysfs attribute: clock_frequency
+ * Read/Write the SMBus clock frequency for this adapter's port.
+ */
+static ssize_t clock_frequency_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct i2c_adapter *adap = to_i2c_adapter(dev);
+	struct i2c_adapter_group *smbus = i2c_get_adapdata(adap);
+	struct i3c_hub *hub = smbus->priv;
+
+	return sprintf(buf, "%u\n",
+		       hub->settings.tp[smbus->tp_port].clock_frequency);
+}
+
+static ssize_t clock_frequency_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct i2c_adapter *adap = to_i2c_adapter(dev);
+	struct i2c_adapter_group *smbus = i2c_get_adapdata(adap);
+	struct i3c_hub *hub = smbus->priv;
+	u32 val;
+	int ret;
+
+	ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	if (!i3c_hub_smbus_validate_clock_frequency(val))
+		return -EINVAL;
+
+	hub->settings.tp[smbus->tp_port].clock_frequency = val;
+
+	return count;
+}
+static DEVICE_ATTR_RW(clock_frequency);
+
+static struct attribute *i3c_hub_smbus_attrs[] = {
+	&dev_attr_clock_frequency.attr,
+	NULL,
+};
+
+ATTRIBUTE_GROUPS(i3c_hub_smbus);
+
 static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 {
 	struct device *dev = i3cdev_to_dev(priv->i3cdev);
@@ -2553,6 +2598,7 @@ static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
 	i2c->algo = &i3c_hub_smbus_algo;
 	i2c->dev.parent = dev;
 	i2c->dev.of_node = smbus->of_node;
+	i2c->dev.groups = i3c_hub_smbus_groups;
 	i2c->timeout = HZ;
 	i2c->retries = 3;
 	snprintf(i2c->name, sizeof(i2c->name), "hub%s.port%d", dev_name(dev),
