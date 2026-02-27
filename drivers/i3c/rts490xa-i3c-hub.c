@@ -2350,7 +2350,7 @@ static int i3c_hub_smbus_ibi_handler(struct i3c_hub *hub,
 {
 	struct i2c_adapter_group *smbus;
 	u8 tp, tps;
-	int val, ret, rc;
+	int val, ret = 0, rc;
 	struct device *dev = i3cdev_to_dev(hub->i3cdev);
 
 	if (payload->len < 2) {
@@ -2366,20 +2366,6 @@ static int i3c_hub_smbus_ibi_handler(struct i3c_hub *hub,
 
 	if (!tps)
 		return 0;
-
-	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
-			   REGISTERS_UNLOCK_CODE);
-	if (ret)
-		return ret;
-
-	ret = regmap_write(hub->regmap, I3C_HUB_TP_IBI_CONF, 0);
-	if (ret)
-		goto exit;
-
-	ret = regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
-			   REGISTERS_LOCK_CODE);
-	if (ret)
-		goto exit;
 
 	while (tps) {
 		tp = (u8)__ffs((unsigned long)tps);
@@ -2398,13 +2384,7 @@ static int i3c_hub_smbus_ibi_handler(struct i3c_hub *hub,
 		}
 	}
 
-exit:
-	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE,
-		     REGISTERS_UNLOCK_CODE);
-
-	regmap_write(hub->regmap, I3C_HUB_TP_IBI_CONF, hub->smbus_ibi_en_mask);
-	regmap_write(hub->regmap, I3C_HUB_PROTECTION_CODE, REGISTERS_LOCK_CODE);
-	return ret;
+	return 0;
 }
 
 static int i3c_hub_smbus_tp_algo(struct i3c_hub *priv, int i)
