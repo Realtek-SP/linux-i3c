@@ -2908,20 +2908,25 @@ static void i3c_hub_io_ibi_handler(struct i3c_hub *hub,
 			level = __ffs(tmp);
 			tmp &= ~(1 << level);
 
+			/* Check if this port is in GPIO mode */
 			index = gpio->port_to_index[level];
 			if (index < 0) {
-				dev_warn_ratelimited(
-					&hub->i3cdev->dev,
-					"IBI on disabled port %d\n", level);
-				regmap_write(hub->regmap,
-					     I3C_HUB_TP_SCL_IN_DETECT_FLG + i,
-					     BIT(level));
+				/* Non-GPIO mode port, skip without clearing.
+				 * This can happen because IN_DETECT IBI enable is
+				 * configured in groups (e.g., TP0145/TP2367), not
+				 * per individual port. Simply skip - the flag is
+				 * harmless and will be overwritten by next detection.
+				 */
+				dev_dbg(&hub->i3cdev->dev,
+					"IBI detect flag on non-GPIO port %d, skipping\n",
+					level);
 				continue;
 			}
 
 			hwirq = index * 2 + i;
 			irq = irq_find_mapping(gc->irq.domain, hwirq);
 
+			/* Clear the flag after processing */
 			regmap_write(hub->regmap,
 				     I3C_HUB_TP_SCL_IN_DETECT_FLG + i,
 				     BIT(level));
