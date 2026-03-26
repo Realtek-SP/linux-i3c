@@ -442,6 +442,7 @@ struct logical_bus {
 struct hub_gpio {
 	struct gpio_chip chip;
 	int tp[GPIO_MAX_BANK];
+	s8 port_to_index[I3C_HUB_TP_MAX_COUNT];
 	int nums;
 	struct irq_chip irq_chip;
 	struct mutex irq_mutex;
@@ -987,6 +988,8 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 	int ret;
 	int i, index;
 
+	memset(priv->gpio.port_to_index, -1, sizeof(priv->gpio.port_to_index));
+
 	for (i = 0; i < priv->dev_info->n_ports; ++i) {
 		if (priv->settings.tp[i].mode !=
 		    I3C_HUB_DT_TP_MODE_NOT_DEFINED) {
@@ -1007,6 +1010,7 @@ static int i3c_hub_hw_configure_tp(struct device *dev)
 				priv->gpio.nums += GPIO_BANK_SZ;
 				index = priv->gpio.nums / GPIO_BANK_SZ - 1;
 				priv->gpio.tp[index] = i;
+				priv->gpio.port_to_index[i] = index;
 			}
 		}
 		if (priv->settings.tp[i].pullup_en !=
@@ -2880,34 +2884,55 @@ static void i3c_hub_io_ibi_handler(struct i3c_hub *hub,
 	u8 level, hwirq, tmp;
 	u8 pending[GPIO_BANK_SZ];
 	u8 tp[GPIO_BANK_SZ];
-	int i, irq;
+	int i, irq, ret, index;
 
-	regmap_bulk_read(hub->regmap, I3C_HUB_TP_SCL_OUT_EN, tp, GPIO_BANK_SZ);
-	regmap_bulk_read(hub->regmap, I3C_HUB_TP_SCL_IN_DETECT_FLG, pending,
-			 GPIO_BANK_SZ);
+	ret = regmap_bulk_read(hub->regmap, I3C_HUB_TP_SCL_OUT_EN, tp,
+			       GPIO_BANK_SZ);
+	if (ret) {
+		dev_err(&hub->i3cdev->dev, "Failed to read OUT_EN: %d\n", ret);
+		return;
+	}
+
+	ret = regmap_bulk_read(hub->regmap, I3C_HUB_TP_SCL_IN_DETECT_FLG,
+			       pending, GPIO_BANK_SZ);
+	if (ret) {
+		dev_err(&hub->i3cdev->dev, "Failed to read DETECT_FLG: %d\n",
+			ret);
+		return;
+	}
 
 	for (i = 0; i < GPIO_BANK_SZ; i++) {
 		tmp = ~tp[i] & pending[i];
 
 		while (tmp) {
 			level = __ffs(tmp);
-			hwirq = 2 * level + i;
-
-			irq = irq_find_mapping(gc->irq.domain, hwirq);
 			tmp &= ~(1 << level);
 
-			if (unlikely(irq <= 0)) {
-				dev_warn_ratelimited(gc->parent,
-						     "unmapped interrupt %d\n",
-						     hwirq);
+			index = gpio->port_to_index[level];
+			if (index < 0) {
+				dev_warn_ratelimited(
+					&hub->i3cdev->dev,
+					"IBI on disabled port %d\n", level);
+				regmap_write(hub->regmap,
+					     I3C_HUB_TP_SCL_IN_DETECT_FLG + i,
+					     BIT(level));
 				continue;
 			}
+
+			hwirq = index * 2 + i;
+			irq = irq_find_mapping(gc->irq.domain, hwirq);
 
 			regmap_write(hub->regmap,
 				     I3C_HUB_TP_SCL_IN_DETECT_FLG + i,
 				     BIT(level));
 
-			handle_nested_irq(irq);
+			if (unlikely(irq <= 0)) {
+				dev_warn_ratelimited(gc->parent,
+						     "unmapped interrupt %d\n",
+						     hwirq);
+			} else {
+				handle_nested_irq(irq);
+			}
 		}
 	}
 }
