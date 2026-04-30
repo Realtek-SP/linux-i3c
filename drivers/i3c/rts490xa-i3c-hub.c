@@ -1908,7 +1908,10 @@ static bool i3c_hub_supports_ccc_cmd(struct i3c_master_controller *controller,
 	struct i3c_master_controller *parent =
 		parent_from_controller(controller);
 
-	return parent->ops->supports_ccc_cmd(parent, cmd);
+	if (parent->ops->supports_ccc_cmd)
+		return parent->ops->supports_ccc_cmd(parent, cmd);
+
+	return true;
 }
 
 static int i3c_hub_send_ccc_cmd(struct i3c_master_controller *controller,
