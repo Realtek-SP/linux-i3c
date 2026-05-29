@@ -520,9 +520,6 @@ static const struct hub_setting io_strength_settings[] = {
 	{ "50Ohms", I3C_HUB_DT_IO_STRENGTH_50_OHM },
 };
 
-/* Global mutex for serializing regmap access across all i3c hubs. */
-static DEFINE_MUTEX(i3c_hub_regmap_mutex);
-
 static u8 i3c_hub_ldo_dt_to_reg(u8 dt_value)
 {
 	switch (dt_value) {
@@ -2989,24 +2986,11 @@ static void i3c_hub_ibi_handler(struct i3c_device *dev,
 
 }
 
-static inline void i3c_hub_regmap_lock(void *__user)
-{
-	mutex_lock(&i3c_hub_regmap_mutex);
-}
-
-static inline void i3c_hub_regmap_unlock(void *__user)
-{
-	mutex_unlock(&i3c_hub_regmap_mutex);
-}
-
 static int i3c_hub_probe(struct i3c_device *i3cdev)
 {
 	struct regmap_config i3c_hub_regmap_config = {
 		.reg_bits = 8,
 		.val_bits = 8,
-		.lock = i3c_hub_regmap_lock,
-		.unlock = i3c_hub_regmap_unlock,
-		.lock_arg = NULL,
 	};
 	struct device *dev = &i3cdev->dev;
 	struct device_node *node = NULL;
